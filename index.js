@@ -326,6 +326,37 @@ async function connectToMongo() {
       await db.collection('coupons').insertMany(INITIAL_COUPONS);
       console.log('🌱 Seeded default coupons to MongoDB');
     }
+
+    // Seed default customer offer notifications
+    const notifCount = await db.collection('notifications').countDocuments();
+    if (notifCount === 0) {
+      await db.collection('notifications').insertMany([
+        {
+          recipient_role: 'customer',
+          title: '🎉 স্পেশাল অফার: খাঁটি পণ্যে বিশেষ ছাড়!',
+          title_en: '🎉 Special Offer: Discount on Organic Products!',
+          message: 'সুন্দরবনের খাঁটি মধু ও গাওয়া ঘিয়ে ১০% থেকে ১৫% পর্যন্ত বিশেষ ক্যাশব্যাক অফার চলছে!',
+          message_en: 'Enjoy 10% to 15% discount on pure Honey and Ghee items today!',
+          type: 'offer',
+          link: '/products',
+          is_read: false,
+          created_at: new Date()
+        },
+        {
+          recipient_role: 'customer',
+          title: '✨ নতুন স্টক আগমন: প্রিমিয়াম আজওয়া খেজুর',
+          title_en: '✨ New Arrival: Premium Ajwa Dates',
+          message: 'মদিনার ফ্রেশ গ্রেড-১ প্রিমিয়াম আজওয়া খেজুর এখন শপে উপলব্ধ। দ্রুত অর্ডার করুন!',
+          message_en: 'Fresh Grade-1 Madinah Ajwa Dates are now in stock. Order now!',
+          type: 'product',
+          link: '/products',
+          is_read: false,
+          created_at: new Date()
+        }
+      ]);
+      console.log('🌱 Seeded default customer announcements and offers');
+    }
+
   } catch (err) {
     console.warn('⚠️ MongoDB connection warning:', err.message, '- Using in-memory fallback database mode.');
     isMongoConnected = false;
@@ -2166,6 +2197,40 @@ app.patch('/api/notifications/:id/read', async (req, res) => {
 
     await notifCol.updateOne(filter, { $set: { is_read: true, read_at: new Date() } });
     res.json({ success: true, message: 'Notification marked as read' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
+app.delete('/api/notifications/:id', async (req, res) => {
+  try {
+    const database = await getDb();
+    const notifCol = database.collection('notifications');
+    const { id } = req.params;
+    let filter = { _id: id };
+    if (ObjectId.isValid(id)) {
+      filter = { $or: [{ _id: new ObjectId(id) }, { _id: id }] };
+    }
+    await notifCol.deleteOne(filter);
+    res.json({ success: true, message: 'Notification deleted' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.delete('/api/notifications/clear-all', async (req, res) => {
+  try {
+    const database = await getDb();
+    const notifCol = database.collection('notifications');
+    const { role, userId, sellerId } = req.body;
+    let query = {};
+    if (role === 'admin') query.recipient_role = 'admin';
+    else if (role === 'seller') query.recipient_role = 'seller';
+    else query.recipient_role = { $in: ['customer', 'all'] };
+
+    await notifCol.deleteMany(query);
+    res.json({ success: true, message: 'All notifications cleared' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
