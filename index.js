@@ -2065,6 +2065,130 @@ app.post('/api/orders', async (req, res) => {
 });
 
 // GET /api/orders - Fetch all orders with query filters and user enrichment
+
+// ==========================================
+// NOTIFICATIONS API (MongoDB Connected)
+// ==========================================
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const database = await getDb();
+    const notifCol = database.collection('notifications');
+    const { role, userId, sellerId, isRead } = req.query;
+
+    const query = {};
+    if (role) {
+      if (role === 'admin') {
+        query.recipient_role = 'admin';
+      } else if (role === 'seller') {
+        const conds = [{ recipient_role: 'seller' }];
+        if (sellerId) {
+          conds.push({ seller_id: sellerId }, { seller_id: Number(sellerId) }, { seller_id: String(sellerId) });
+        }
+        query.$or = conds;
+      } else if (role === 'customer') {
+        const conds = [{ recipient_role: 'customer' }, { recipient_role: 'all' }];
+        if (userId) {
+          conds.push({ user_id: userId }, { user_id: Number(userId) }, { user_id: String(userId) });
+        }
+        query.$or = conds;
+      }
+    }
+
+    if (isRead === 'false') {
+      query.is_read = false;
+    }
+
+    const notifications = await notifCol.find(query).sort({ created_at: -1 }).limit(30).toArray();
+    const unreadCount = await notifCol.countDocuments({ ...query, is_read: false });
+
+    res.json({
+      success: true,
+      unreadCount,
+      total: notifications.length,
+      data: notifications.map(n => ({
+        id: n._id.toString(),
+        _id: n._id.toString(),
+        ...n
+      }))
+    });
+  } catch (err) {
+    console.error('getNotifications error:', err.message);
+    res.status(500).json({ success: false, error: err.message, data: [], unreadCount: 0 });
+  }
+});
+
+app.post('/api/notifications', async (req, res) => {
+  try {
+    const database = await getDb();
+    const notifCol = database.collection('notifications');
+    const { recipient_role = 'all', title, title_en, message, message_en, type = 'announcement', user_id, seller_id, link } = req.body;
+
+    if (!title || !message) {
+      return res.status(400).json({ success: false, message: 'Title and message are required' });
+    }
+
+    const newNotif = {
+      recipient_role,
+      title,
+      title_en: title_en || title,
+      message,
+      message_en: message_en || message,
+      type,
+      user_id: user_id || null,
+      seller_id: seller_id || null,
+      link: link || '',
+      is_read: false,
+      created_at: new Date()
+    };
+
+    const result = await notifCol.insertOne(newNotif);
+    res.status(201).json({
+      success: true,
+      message: 'Notification created successfully',
+      data: { id: result.insertedId.toString(), ...newNotif }
+    });
+  } catch (err) {
+    console.error('createNotification error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to create notification' });
+  }
+});
+
+app.patch('/api/notifications/:id/read', async (req, res) => {
+  try {
+    const database = await getDb();
+    const notifCol = database.collection('notifications');
+    const { id } = req.params;
+
+    let filter = { _id: id };
+    if (ObjectId.isValid(id)) {
+      filter = { $or: [{ _id: new ObjectId(id) }, { _id: id }] };
+    }
+
+    await notifCol.updateOne(filter, { $set: { is_read: true, read_at: new Date() } });
+    res.json({ success: true, message: 'Notification marked as read' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.patch('/api/notifications/read-all', async (req, res) => {
+  try {
+    const database = await getDb();
+    const notifCol = database.collection('notifications');
+    const { role, userId, sellerId } = req.body;
+
+    const query = { is_read: false };
+    if (role === 'admin') query.recipient_role = 'admin';
+    else if (role === 'seller') query.recipient_role = 'seller';
+    else if (role === 'customer') query.recipient_role = { $in: ['customer', 'all'] };
+
+    await notifCol.updateMany(query, { $set: { is_read: true, read_at: new Date() } });
+    res.json({ success: true, message: 'All notifications marked as read' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 app.get('/api/orders', async (req, res) => {
   try {
     const { status, search, userId, customerPhone, customerEmail, sellerId } = req.query;
