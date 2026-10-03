@@ -7,8 +7,8 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/ghorer_bazar_db';
-const DB_NAME = process.env.DB_NAME || 'ghorer_bazar_db';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://e-commerce-web-db:MWGAsRlFV4ltq3Ef@ac-mmp9lh3-shard-00-00.bljwodf.mongodb.net:27017,ac-mmp9lh3-shard-00-01.bljwodf.mongodb.net:27017,ac-mmp9lh3-shard-00-02.bljwodf.mongodb.net:27017/?ssl=true&replicaSet=atlas-12i85x-shard-0&authSource=admin&appName=Cluster0';
+const DB_NAME = process.env.DB_NAME || 'e-commerce-web-data';
 const JWT_SECRET = process.env.JWT_SECRET || 'ghorer_bazar_secret_super_key_2024';
 
 // Middlewares
@@ -270,6 +270,30 @@ const memoryDb = {
 let db = null;
 let isMongoConnected = false;
 
+
+// Cached MongoDB Connection for Serverless (Vercel) & Local
+let cachedClient = null;
+let cachedDb = null;
+
+async function getDb() {
+  if (cachedDb) return cachedDb;
+  try {
+    if (!cachedClient) {
+      cachedClient = new MongoClient(MONGODB_URI, {
+        serverSelectionTimeoutMS: 10000,
+      });
+      await cachedClient.connect();
+    }
+    cachedDb = cachedClient.db(DB_NAME);
+    db = cachedDb;
+    isMongoConnected = true;
+    return cachedDb;
+  } catch (err) {
+    console.error('❌ MongoDB getDb connection error:', err.message);
+    throw err;
+  }
+}
+
 async function connectToMongo() {
   try {
     const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 2500 });
@@ -372,9 +396,10 @@ app.get('/api', (req, res) => {
 // 1. PRODUCTS API
 app.get('/api/products', async (req, res) => {
   try {
+    const db = await getDb();
     const { category, search, sellerId, featured, bestSeller, sort, minPrice, maxPrice, inStock, limit = 100, page = 1 } = req.query;
 
-    if (isMongoConnected && db) {
+    if (db) {
       const andConditions = [];
 
       if (category && category !== 'all') {
@@ -3391,3 +3416,5 @@ app.get('/api/payments', async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to fetch payments', error: error.message });
   }
 });
+
+module.exports = app;
