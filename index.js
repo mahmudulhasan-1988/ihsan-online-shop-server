@@ -372,6 +372,29 @@ app.get('/', (req, res) => {
   res.send('🌿 Ihsan Online Shop Server is Running Successfully! 🚀');
 });
 
+
+// DB Connection Diagnostic Endpoint
+app.get('/api/db-status', async (req, res) => {
+  try {
+    const database = await getDb();
+    const productCount = await database.collection('products').countDocuments();
+    const collections = await database.listCollections().toArray();
+    res.json({
+      success: true,
+      status: 'Connected to MongoDB',
+      dbName: database.databaseName,
+      productCount,
+      collections: collections.map(c => c.name)
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      status: 'Failed to connect to MongoDB',
+      error: err.message
+    });
+  }
+});
+
 app.get('/api', (req, res) => {
   res.json({
     status: 'success',
