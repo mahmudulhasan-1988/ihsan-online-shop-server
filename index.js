@@ -343,6 +343,21 @@ const formatDoc = (doc) => {
 // API ROUTES
 // ----------------------------------------------------
 
+// Root route for Vercel health check
+app.get('/', (req, res) => {
+  res.send('🌿 Ihsan Online Shop Server is Running Successfully! 🚀');
+});
+
+app.get('/api', (req, res) => {
+  res.json({
+    status: 'success',
+    message: 'Ihsan Online Shop API is Live & Connected to MongoDB!'
+  });
+});
+
+
+
+
 // Root Check
 app.get('/api', (req, res) => {
   res.json({
