@@ -2223,7 +2223,9 @@ app.delete('/api/notifications/clear-all', async (req, res) => {
   try {
     const database = await getDb();
     const notifCol = database.collection('notifications');
-    const { role, userId, sellerId } = req.body;
+    const role = req.body?.role || req.query?.role;
+    const userId = req.body?.userId || req.query?.userId;
+    const sellerId = req.body?.sellerId || req.query?.sellerId;
     let query = {};
     if (role === 'admin') query.recipient_role = 'admin';
     else if (role === 'seller') query.recipient_role = 'seller';
@@ -2240,7 +2242,9 @@ app.patch('/api/notifications/read-all', async (req, res) => {
   try {
     const database = await getDb();
     const notifCol = database.collection('notifications');
-    const { role, userId, sellerId } = req.body;
+    const role = req.body?.role || req.query?.role;
+    const userId = req.body?.userId || req.query?.userId;
+    const sellerId = req.body?.sellerId || req.query?.sellerId;
 
     const query = { is_read: false };
     if (role === 'admin') query.recipient_role = 'admin';
