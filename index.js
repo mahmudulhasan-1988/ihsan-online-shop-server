@@ -2203,22 +2203,6 @@ app.patch('/api/notifications/:id/read', async (req, res) => {
 });
 
 
-app.delete('/api/notifications/:id', async (req, res) => {
-  try {
-    const database = await getDb();
-    const notifCol = database.collection('notifications');
-    const { id } = req.params;
-    let filter = { _id: id };
-    if (ObjectId.isValid(id)) {
-      filter = { $or: [{ _id: new ObjectId(id) }, { _id: id }] };
-    }
-    await notifCol.deleteOne(filter);
-    res.json({ success: true, message: 'Notification deleted' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
 app.delete('/api/notifications/clear-all', async (req, res) => {
   try {
     const database = await getDb();
@@ -2233,6 +2217,22 @@ app.delete('/api/notifications/clear-all', async (req, res) => {
 
     await notifCol.deleteMany(query);
     res.json({ success: true, message: 'All notifications cleared' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.delete('/api/notifications/:id', async (req, res) => {
+  try {
+    const database = await getDb();
+    const notifCol = database.collection('notifications');
+    const { id } = req.params;
+    let filter = { _id: id };
+    if (ObjectId.isValid(id)) {
+      filter = { $or: [{ _id: new ObjectId(id) }, { _id: id }] };
+    }
+    await notifCol.deleteOne(filter);
+    res.json({ success: true, message: 'Notification deleted' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
