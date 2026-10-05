@@ -2051,29 +2051,138 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
-    // 3. Create Admin & Customer Notifications
+    // 3. Create Admin & Seller Notifications (Multi-Seller Aware)
     if (db) {
       const notifCol = db.collection('notifications');
+      const prodCol = db.collection('products');
+      const sellersCol = db.collection('sellers');
+
+      // (A) Admin Notification
       const adminNotif = {
         recipient_role: 'admin',
         title: '🔔 নতুন অর্ডার এসেছে!',
+        title_en: '🔔 New Order Received!',
         message: `কাস্টমার ${name} (ফোন: ${phone}) নতুন অর্ডার করেছেন (${orderId})। মোট মূল্য: ৳${calculatedTotal}`,
+        message_en: `Customer ${name} (Phone: ${phone}) placed order ${orderId}. Total: ৳${calculatedTotal}`,
         orderId,
+        order_id: orderId,
         type: 'new_order',
+        link: '/admin',
         is_read: false,
-        createdAt: now.toISOString()
+        createdAt: now.toISOString(),
+        created_at: now
       };
       await notifCol.insertOne(adminNotif);
 
+      // (B) Group ordered items by Seller and create Seller Notifications
+      const sellerGroups = {};
+      for (const it of formattedItems) {
+        let sId = it.sellerId || it.seller_id;
+        let sName = it.sellerName || it.seller_name;
+        let sStore = '';
+        let sUser = null;
+        let sEmail = '';
+        let sPhone = '';
+
+        // Query product details from MongoDB to get accurate Seller info
+        if (it.productId) {
+          try {
+            let pFilter = { _id: it.productId };
+            if (ObjectId.isValid(it.productId)) {
+              pFilter = { $or: [{ _id: new ObjectId(it.productId) }, { _id: it.productId }] };
+            }
+            const prodDoc = await prodCol.findOne(pFilter);
+            if (prodDoc) {
+              sId = sId || prodDoc.seller_id || prodDoc.sellerId;
+              sName = sName || prodDoc.seller_name || prodDoc.sellerName;
+              sStore = prodDoc.seller_store || prodDoc.shop_name || sStore;
+            }
+          } catch (pe) {}
+        }
+
+        // Query sellers collection if available to find matching seller account
+        if (sId) {
+          try {
+            let sFilter = { $or: [{ id: sId }, { id: Number(sId) }, { _id: sId }, { user_id: sId }, { shop_name: sName }] };
+            if (ObjectId.isValid(sId)) {
+              sFilter.$or.push({ _id: new ObjectId(sId) });
+            }
+            const sellerDoc = await sellersCol.findOne(sFilter);
+            if (sellerDoc) {
+              sUser = sellerDoc.user_id || sUser;
+              sEmail = sellerDoc.email || sEmail;
+              sPhone = sellerDoc.phone || sPhone;
+              sStore = sellerDoc.shop_name || sStore || sellerDoc.name;
+              sName = sellerDoc.shop_name || sellerDoc.name || sName;
+            }
+          } catch (se) {}
+        }
+
+        const sellerKey = String(sId || sUser || sName || '1');
+        if (!sellerGroups[sellerKey]) {
+          sellerGroups[sellerKey] = {
+            sellerId: sellerKey,
+            sellerName: sName || 'সেলার',
+            sellerStore: sStore || sName || 'অনলাইন স্টোর',
+            sellerUserId: sUser ? String(sUser) : sellerKey,
+            sellerEmail: sEmail,
+            sellerPhone: sPhone,
+            items: [],
+            totalQty: 0,
+            subtotal: 0
+          };
+        }
+
+        sellerGroups[sellerKey].items.push(it);
+        sellerGroups[sellerKey].totalQty += (Number(it.quantity) || 1);
+        sellerGroups[sellerKey].subtotal += (Number(it.price) || 0) * (Number(it.quantity) || 1);
+      }
+
+      // Insert Notification for each Seller whose products are ordered
+      for (const sKey of Object.keys(sellerGroups)) {
+        const group = sellerGroups[sKey];
+        const itemsSummary = group.items.map(i => i.name).slice(0, 2).join(', ') + (group.items.length > 2 ? ` এবং আরও ${group.items.length - 2}টি` : '');
+        
+        const sellerNotif = {
+          recipient_role: 'seller',
+          seller_id: group.sellerId,
+          sellerId: group.sellerId,
+          user_id: group.sellerUserId,
+          seller_name: group.sellerName,
+          seller_store: group.sellerStore,
+          seller_email: group.sellerEmail || null,
+          seller_phone: group.sellerPhone || null,
+          title: '🔔 আপনার পণ্যের নতুন অর্ডার এসেছে!',
+          title_en: '🔔 New Order for Your Products!',
+          message: `কাস্টমার ${name} (ফোন: ${phone}) আপনার পণ্য "${itemsSummary}" অর্ডার করেছেন (${orderId})। পরিমাণ: ${group.totalQty}টি, মোট মূল্য: ৳${group.subtotal}`,
+          message_en: `Customer ${name} (Phone: ${phone}) ordered your product "${itemsSummary}" (${orderId}). Qty: ${group.totalQty}, Total: ৳${group.subtotal}`,
+          orderId,
+          order_id: orderId,
+          type: 'new_order',
+          link: '/seller',
+          items: group.items,
+          is_read: false,
+          createdAt: now.toISOString(),
+          created_at: now
+        };
+        await notifCol.insertOne(sellerNotif);
+      }
+
+      // (C) Customer confirmation notification if registered
       if (finalUserId) {
         const custNotif = {
           user_id: finalUserId,
+          recipient_role: 'customer',
           title: '📦 অর্ডার কনফার্মেশনের অপেক্ষায়',
+          title_en: '📦 Order Pending Confirmation',
           message: `আপনার অর্ডার (${orderId}) সফলভাবে গৃহীত হয়েছে। মোট মূল্য: ৳${calculatedTotal}`,
+          message_en: `Your order (${orderId}) was placed successfully. Total: ৳${calculatedTotal}`,
           orderId,
+          order_id: orderId,
           type: 'order_status',
           is_read: false,
-          createdAt: now.toISOString()
+          createdAt: now.toISOString(),
+          created_at: now
         };
         await notifCol.insertOne(custNotif);
       }
@@ -2104,25 +2213,61 @@ app.get('/api/notifications', async (req, res) => {
   try {
     const database = await getDb();
     const notifCol = database.collection('notifications');
-    const { role, userId, sellerId, isRead } = req.query;
+    const { role, userId, sellerId, sellerEmail, sellerPhone, sellerStore, isRead } = req.query;
 
-    const query = {};
-    if (role) {
-      if (role === 'admin') {
-        query.recipient_role = 'admin';
-      } else if (role === 'seller') {
-        const conds = [{ recipient_role: 'seller' }];
-        if (sellerId) {
-          conds.push({ seller_id: sellerId }, { seller_id: Number(sellerId) }, { seller_id: String(sellerId) });
+    let query = {};
+    if (role === 'admin') {
+      query.recipient_role = 'admin';
+    } else if (role === 'seller') {
+      const sellerOrConditions = [
+        { recipient_role: 'all' },
+        { type: { $in: ['announcement', 'offer'] }, recipient_role: { $in: ['seller', 'all'] } }
+      ];
+
+      const sIdVals = [sellerId, userId].filter(Boolean);
+      sIdVals.forEach(val => {
+        const strVal = String(val);
+        sellerOrConditions.push(
+          { seller_id: strVal },
+          { sellerId: strVal },
+          { user_id: strVal },
+          { recipient_role: 'seller', seller_id: strVal },
+          { recipient_role: 'seller', user_id: strVal }
+        );
+        if (!isNaN(Number(val))) {
+          sellerOrConditions.push(
+            { seller_id: Number(val) },
+            { sellerId: Number(val) }
+          );
         }
-        query.$or = conds;
-      } else if (role === 'customer') {
-        const conds = [{ recipient_role: 'customer' }, { recipient_role: 'all' }];
-        if (userId) {
-          conds.push({ user_id: userId }, { user_id: Number(userId) }, { user_id: String(userId) });
-        }
-        query.$or = conds;
+      });
+
+      if (sellerEmail) {
+        sellerOrConditions.push({ seller_email: String(sellerEmail).toLowerCase() });
       }
+      if (sellerPhone) {
+        sellerOrConditions.push({ seller_phone: String(sellerPhone) });
+      }
+      if (sellerStore) {
+        sellerOrConditions.push({ seller_store: String(sellerStore) }, { seller_name: String(sellerStore) });
+      }
+
+      // If no specific seller identifiers provided, return all seller notifications
+      if (sIdVals.length === 0 && !sellerEmail && !sellerPhone && !sellerStore) {
+        query.recipient_role = 'seller';
+      } else {
+        query = {
+          $and: [
+            { recipient_role: { $in: ['seller', 'all'] } },
+            { $or: sellerOrConditions }
+          ]
+        };
+      }
+    } else if (role === 'customer') {
+      query = {
+        recipient_role: { $in: ['customer', 'all'] },
+        type: { $in: ['product', 'offer', 'announcement', 'discount'] }
+      };
     }
 
     if (isRead === 'false') {
