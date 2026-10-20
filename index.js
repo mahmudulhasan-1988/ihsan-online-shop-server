@@ -3778,4 +3778,296 @@ app.get('/api/payments', async (req, res) => {
   }
 });
 
+
+// ============================================================================
+// 🎧 SUPPORT TICKETS & HELPDESK API (MONGODB CONNECTED)
+// ============================================================================
+
+// POST /api/tickets - Customer creates a new support ticket
+app.post('/api/tickets', async (req, res) => {
+  try {
+    const raw = req.body || {};
+    if (!raw.subject || !raw.message) {
+      return res.status(400).json({ success: false, message: 'বিষয় এবং বিস্তারিত বার্তা প্রদান করা আবশ্যক' });
+    }
+
+    const ticketId = 'TKT-' + Date.now().toString().slice(-6);
+    const newTicket = {
+      ticket_id: ticketId,
+      user_id: String(raw.userId || raw.user_id || 'customer'),
+      user_name: raw.userName || raw.user_name || 'সম্মানিত গ্রাহক',
+      user_email: raw.userEmail || raw.user_email || '',
+      user_phone: raw.userPhone || raw.user_phone || '',
+      user_role: raw.userRole || raw.user_role || 'customer',
+      subject: String(raw.subject).trim(),
+      message: String(raw.message).trim(),
+      category: raw.category || 'সাধারণ অনুসন্ধান (General Inquiry)',
+      order_id: raw.orderId || raw.order_id || '',
+      priority: raw.priority || 'medium',
+      status: 'open', // 'open' | 'pending' | 'resolution' | 'closed'
+      status_display: 'New',
+      assigned_seller_id: null,
+      assigned_seller_name: null,
+      assigned_seller_email: null,
+      assigned_seller_phone: null,
+      forward_note: '',
+      forwarded_at: null,
+      resolution_note: '',
+      resolved_at: null,
+      resolved_by: '',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    if (isMongoConnected && db) {
+      const result = await db.collection('support_tickets').insertOne(newTicket);
+      
+      // Notify Admin
+      try {
+        await db.collection('notifications').insertOne({
+          type: 'ticket',
+          title: 'নতুন সাপোর্ট টিকিট সাবমিট হয়েছে',
+          message: `${newTicket.user_name} নতুন একটি সাপোর্ট টিকিট ওপেন করেছেন: "${newTicket.subject}"`,
+          link: '/admin',
+          ticket_id: ticketId,
+          is_read: false,
+          created_at: new Date().toISOString()
+        });
+      } catch (ne) {
+        console.error('Notification error', ne);
+      }
+
+      return res.json({
+        success: true,
+        message: 'আপনার সাপোর্ট টিকিটটি সফলভাবে সাবমিট হয়েছে!',
+        data: { ...newTicket, _id: result.insertedId.toString(), id: result.insertedId.toString() }
+      });
+    }
+
+    return res.json({ success: true, message: 'টিকেট সাবমিট হয়েছে (Fallback)', data: newTicket });
+  } catch (error) {
+    console.error('Ticket submit error:', error);
+    res.status(500).json({ success: false, message: 'টিকেট সাবমিট করতে ত্রুটি হয়েছে', error: error.message });
+  }
+});
+
+// GET /api/tickets - Fetch support tickets (all for admin, or filtered by customer / seller)
+app.get('/api/tickets', async (req, res) => {
+  try {
+    const { userId, sellerId, status } = req.query;
+    if (isMongoConnected && db) {
+      let query = {};
+      
+      // Customer filter
+      if (userId && userId !== 'all') {
+        const uStr = String(userId).trim();
+        query.$or = [
+          { user_id: uStr },
+          { user_email: uStr.toLowerCase() },
+          { user_phone: uStr }
+        ];
+      }
+
+      // Seller filter
+      if (sellerId && sellerId !== 'all') {
+        const sStr = String(sellerId).trim();
+        const sellerOr = [
+          { assigned_seller_id: sStr },
+          { assigned_seller_email: sStr.toLowerCase() },
+          { assigned_seller_phone: sStr }
+        ];
+        if (query.$or) {
+          query = { $and: [{ $or: query.$or }, { $or: sellerOr }] };
+          delete query.$or;
+        } else {
+          query.$or = sellerOr;
+        }
+      }
+
+      // Status filter
+      if (status && status !== 'all') {
+        query.status = status;
+      }
+
+      const tickets = await db.collection('support_tickets')
+        .find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .toArray();
+
+      const formatted = tickets.map(t => ({
+        ...t,
+        id: t._id ? t._id.toString() : t.ticket_id,
+        _id: t._id ? t._id.toString() : t.ticket_id
+      }));
+
+      return res.json({ success: true, count: formatted.length, data: formatted });
+    }
+
+    return res.json({ success: true, count: 0, data: [] });
+  } catch (error) {
+    console.error('Fetch tickets error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch tickets', error: error.message });
+  }
+});
+
+// GET /api/tickets/:id - Get single ticket details
+app.get('/api/tickets/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (isMongoConnected && db) {
+      let filter = { ticket_id: id };
+      if (ObjectId.isValid(id) && id.length === 24) {
+        filter = { $or: [{ _id: new ObjectId(id) }, { ticket_id: id }] };
+      }
+      const ticket = await db.collection('support_tickets').findOne(filter);
+      if (!ticket) {
+        return res.status(404).json({ success: false, message: 'Ticket not found' });
+      }
+      return res.json({
+        success: true,
+        data: { ...ticket, id: ticket._id ? ticket._id.toString() : ticket.ticket_id, _id: ticket._id ? ticket._id.toString() : ticket.ticket_id }
+      });
+    }
+    return res.status(404).json({ success: false, message: 'Database not connected' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to get ticket', error: error.message });
+  }
+});
+
+// PATCH /api/tickets/:id/forward - Admin forwards ticket to a Seller (Status becomes 'pending')
+app.patch('/api/tickets/:id/forward', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { sellerId, sellerName, sellerEmail, sellerPhone, forwardNote } = req.body || {};
+
+    if (!sellerId && !sellerName) {
+      return res.status(400).json({ success: false, message: 'অনুগ্রহ করে সেলার নির্বাচন করুন' });
+    }
+
+    if (isMongoConnected && db) {
+      let filter = { ticket_id: id };
+      if (ObjectId.isValid(id) && id.length === 24) {
+        filter = { $or: [{ _id: new ObjectId(id) }, { ticket_id: id }] };
+      }
+
+      const updateData = {
+        status: 'pending', // Pending status until seller resolves it
+        status_display: 'Pending',
+        assigned_seller_id: String(sellerId || ''),
+        assigned_seller_name: sellerName || 'সেলার',
+        assigned_seller_email: sellerEmail || '',
+        assigned_seller_phone: sellerPhone || '',
+        forward_note: forwardNote || 'অ্যাডমিন থেকে সেলারের কাছে সমস্যাটি ফরোয়ার্ড করা হয়েছে।',
+        forwarded_at: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      await db.collection('support_tickets').updateOne(filter, { $set: updateData });
+      const updatedDoc = await db.collection('support_tickets').findOne(filter);
+
+      // Notification for Seller
+      try {
+        await db.collection('notifications').insertOne({
+          type: 'ticket_forwarded',
+          target_user_id: String(sellerId || ''),
+          target_role: 'seller',
+          title: 'নতুন সমস্যা ফরোয়ার্ড করা হয়েছে',
+          message: `অ্যাডমিন আপনার জন্য একটি গ্রাহক সাপোর্ট টিকিট ফরোয়ার্ড করেছেন: "${updatedDoc?.subject || 'সহায়তা প্রয়োজন'}"`,
+          link: '/seller',
+          ticket_id: id,
+          is_read: false,
+          created_at: new Date().toISOString()
+        });
+      } catch (ne) {
+        console.error('Notification error', ne);
+      }
+
+      return res.json({
+        success: true,
+        message: `সফলভাবে '${sellerName || 'সেলার'}' এর কাছে টিকিট ফরোয়ার্ড করা হয়েছে। এখন এটি Pending অবস্থায় রয়েছে।`,
+        data: updatedDoc ? { ...updatedDoc, id: updatedDoc._id?.toString(), _id: updatedDoc._id?.toString() } : updateData
+      });
+    }
+
+    res.json({ success: true, message: 'ফরওয়ার্ড সফল (Fallback)' });
+  } catch (error) {
+    console.error('Forward ticket error:', error);
+    res.status(500).json({ success: false, message: 'ফরওয়ার্ড করতে ত্রুটি হয়েছে', error: error.message });
+  }
+});
+
+// PATCH /api/tickets/:id/resolve - Seller resolves ticket (Status becomes 'resolution')
+app.patch('/api/tickets/:id/resolve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { resolutionNote, resolvedBy } = req.body || {};
+
+    if (isMongoConnected && db) {
+      let filter = { ticket_id: id };
+      if (ObjectId.isValid(id) && id.length === 24) {
+        filter = { $or: [{ _id: new ObjectId(id) }, { ticket_id: id }] };
+      }
+
+      const updateData = {
+        status: 'resolution', // Status changes from Pending to Resolution
+        status_display: 'Resolution',
+        resolution_note: resolutionNote || 'সেলার কর্তৃক সমস্যার সমাধান সম্পন্ন হয়েছে।',
+        resolved_at: new Date().toISOString(),
+        resolved_by: resolvedBy || 'সেলার',
+        updatedAt: new Date().toISOString()
+      };
+
+      await db.collection('support_tickets').updateOne(filter, { $set: updateData });
+      const updatedDoc = await db.collection('support_tickets').findOne(filter);
+
+      // Notify customer
+      try {
+        if (updatedDoc?.user_id) {
+          await db.collection('notifications').insertOne({
+            type: 'ticket_resolved',
+            target_user_id: String(updatedDoc.user_id),
+            title: 'আপনার সাপোর্ট সমস্যা সমাধান হয়েছে',
+            message: `আপনার টিকিট "${updatedDoc.subject || ''}" এর সমাধান সম্পন্ন হয়েছে (Resolution)।`,
+            link: '/dashboard',
+            ticket_id: id,
+            is_read: false,
+            created_at: new Date().toISOString()
+          });
+        }
+      } catch (ne) {
+        console.error('Notification error', ne);
+      }
+
+      return res.json({
+        success: true,
+        message: '🎉 টিকিটটি সফলভাবে Resolution করা হয়েছে!',
+        data: updatedDoc ? { ...updatedDoc, id: updatedDoc._id?.toString(), _id: updatedDoc._id?.toString() } : updateData
+      });
+    }
+
+    res.json({ success: true, message: 'Resolution সফল (Fallback)' });
+  } catch (error) {
+    console.error('Resolve ticket error:', error);
+    res.status(500).json({ success: false, message: 'Resolution করতে ত্রুটি হয়েছে', error: error.message });
+  }
+});
+
+// DELETE /api/tickets/:id - Delete/Archive ticket
+app.delete('/api/tickets/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (isMongoConnected && db) {
+      let filter = { ticket_id: id };
+      if (ObjectId.isValid(id) && id.length === 24) {
+        filter = { $or: [{ _id: new ObjectId(id) }, { ticket_id: id }] };
+      }
+      await db.collection('support_tickets').deleteOne(filter);
+      return res.json({ success: true, message: 'টিকেট মুছে ফেলা হয়েছে' });
+    }
+    res.json({ success: true, message: 'টিকেট মুছে ফেলা হয়েছে' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'মুছে ফেলতে ত্রুটি', error: error.message });
+  }
+});
+
 module.exports = app;
