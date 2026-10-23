@@ -2031,6 +2031,32 @@ app.post('/api/orders', async (req, res) => {
       newOrder.id = 'ord-' + Date.now();
     }
 
+    // (A) Auto-Recover Incomplete Order if phone, email or sessionId matches
+    if (db) {
+      try {
+        const incCol = db.collection('incomplete_orders');
+        const orConds = [];
+        if (phone) orConds.push({ customerPhone: phone });
+        if (finalEmail) orConds.push({ customerEmail: finalEmail });
+        if (req.body.sessionId || req.body.session_id) orConds.push({ session_id: req.body.sessionId || req.body.session_id });
+        if (orConds.length > 0) {
+          await incCol.updateMany(
+            { $or: orConds, status: { $in: ['pending', 'contacted'] } },
+            {
+              $set: {
+                status: 'recovered',
+                convertedOrderId: orderId,
+                convertedAt: now.toISOString(),
+                updatedAt: now.toISOString()
+              }
+            }
+          );
+        }
+      } catch (incErr) {
+        console.error('Auto-recovery update error:', incErr.message);
+      }
+    }
+
     // 2. Auto-Reduce Product Stock in MongoDB
     if (db) {
       const prodCol = db.collection('products');
@@ -4069,5 +4095,429 @@ app.delete('/api/tickets/:id', async (req, res) => {
     res.status(500).json({ success: false, message: 'মুছে ফেলতে ত্রুটি', error: error.message });
   }
 });
+
+
+// =========================================================================
+// 🛒 INCOMPLETE ORDERS / ABANDONED CART RECOVERY SYSTEM (CONNECTED TO MONGODB)
+// =========================================================================
+
+// POST /api/incomplete-orders - Upsert incomplete order on Add to Cart, Fast Order, or Instant Order Click
+app.post('/api/incomplete-orders', async (req, res) => {
+  try {
+    const {
+      session_id,
+      sessionId,
+      userId,
+      user_id,
+      customerName,
+      customerPhone,
+      customerEmail,
+      customerAvatar,
+      deliveryAddress,
+      deliveryZone,
+      deliveryCharge,
+      items,
+      subtotal,
+      totalAmount,
+      source,
+      adminNotes
+    } = req.body;
+
+    const sId = (session_id || sessionId || '').trim();
+    const phone = (customerPhone || '').trim();
+    const name = (customerName || '').trim();
+    const email = (customerEmail || '').trim().toLowerCase();
+    const address = (deliveryAddress || '').trim();
+    const currentUserId = userId || user_id || null;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, message: 'কমপক্ষে ১টি পণ্য প্রদান করুন' });
+    }
+
+    const calculatedDelivery = Number(deliveryCharge) || (deliveryZone === 'inside_dhaka' ? 70 : 120);
+    const now = new Date();
+
+    const formattedItems = items.map((it) => ({
+      productId: String(it.productId || it.id || it._id || ''),
+      name: it.name || it.title || 'পণ্য',
+      weight: it.weight || it.unit || 'Standard',
+      price: Number(it.price || 0),
+      quantity: Number(it.quantity || 1),
+      image: it.image || it.thumbnail || (Array.isArray(it.images) ? it.images[0] : '') || 'https://images.unsplash.com/photo-1587049352846-4a222e784d38?auto=format&fit=crop&w=600&q=80'
+    }));
+
+    if (isMongoConnected && db) {
+      const incCol = db.collection('incomplete_orders');
+      const processedDocs = [];
+
+      // 🛒 Customer Identifier conditions
+      const customerOr = [];
+      if (sId) customerOr.push({ session_id: sId });
+      if (phone && phone.length >= 11) customerOr.push({ customerPhone: phone });
+      if (email && email.includes('@')) customerOr.push({ customerEmail: email });
+      if (currentUserId) customerOr.push({ user_id: currentUserId });
+
+      // 🌟 Process EACH distinct product as its OWN separate incomplete order
+      for (const it of formattedItems) {
+        const pId = it.productId;
+        const itemSubtotal = it.price * it.quantity;
+        const itemTotal = itemSubtotal + calculatedDelivery;
+
+        // Product Identifier conditions
+        const productOr = [];
+        if (pId) {
+          productOr.push({ productId: pId });
+          productOr.push({ 'items.productId': pId });
+        }
+        if (it.name) {
+          productOr.push({ productName: it.name });
+          productOr.push({ 'items.name': it.name });
+        }
+
+        let existing = null;
+        if (customerOr.length > 0 && productOr.length > 0) {
+          existing = await incCol.findOne({
+            $and: [
+              { $or: customerOr },
+              { $or: productOr },
+              { status: { $in: ['pending', 'contacted'] } }
+            ]
+          });
+        }
+
+        if (existing) {
+          // Update existing incomplete order for THIS specific product
+          const updateFields = {
+            productId: pId,
+            productName: it.name,
+            items: [it],
+            subtotal: itemSubtotal,
+            deliveryCharge: calculatedDelivery,
+            totalAmount: itemTotal,
+            deliveryZone: deliveryZone || existing.deliveryZone || 'inside_dhaka',
+            source: source || existing.source || 'Instant Order',
+            updatedAt: now.toISOString()
+          };
+
+          if (name && name !== 'অজ্ঞাত ক্রেতা (Guest)') updateFields.customerName = name;
+          if (phone && phone !== 'নম্বর দেয়নি / অপেক্ষমান') updateFields.customerPhone = phone;
+          if (email) updateFields.customerEmail = email;
+          if (address) updateFields.deliveryAddress = address;
+          if (customerAvatar) updateFields.customerAvatar = customerAvatar;
+          if (currentUserId) updateFields.user_id = currentUserId;
+
+          await incCol.updateOne({ _id: existing._id }, { $set: updateFields });
+          const updated = await incCol.findOne({ _id: existing._id });
+          processedDocs.push(updated);
+        } else {
+          // Create a brand new distinct incomplete order document for this product
+          const newIncOrder = {
+            incomplete_order_id: 'INC-' + Math.floor(100000 + Math.random() * 900000),
+            session_id: sId || ('sess_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7)),
+            user_id: currentUserId,
+            productId: pId,
+            productName: it.name,
+            customerName: name || 'অজ্ঞাত ক্রেতা (Guest)',
+            customerPhone: phone || 'নম্বর দেয়নি / অপেক্ষমান',
+            customerEmail: email || '',
+            customerAvatar: customerAvatar || '',
+            deliveryAddress: address || '',
+            deliveryZone: deliveryZone || 'inside_dhaka',
+            deliveryCharge: calculatedDelivery,
+            subtotal: itemSubtotal,
+            totalAmount: itemTotal,
+            items: [it],
+            source: source || 'Instant Order Modal',
+            status: 'pending', // 'pending' | 'contacted' | 'recovered' | 'cancelled'
+            adminNotes: adminNotes || '',
+            lastContactedAt: null,
+            convertedOrderId: null,
+            convertedAt: null,
+            createdAt: now.toISOString(),
+            updatedAt: now.toISOString()
+          };
+
+          const result = await incCol.insertOne(newIncOrder);
+          newIncOrder._id = result.insertedId;
+          processedDocs.push(newIncOrder);
+        }
+      }
+
+      // 🔄 If customer provided contact details, sync across all other incomplete orders for this customer
+      if ((phone && phone.length >= 11) || (name && name !== 'অজ্ঞাত ক্রেতা (Guest)') || address) {
+        const enrichFields = {};
+        if (phone && phone.length >= 11) enrichFields.customerPhone = phone;
+        if (name && name !== 'অজ্ঞাত ক্রেতা (Guest)') enrichFields.customerName = name;
+        if (address) enrichFields.deliveryAddress = address;
+        if (email) enrichFields.customerEmail = email;
+        if (currentUserId) enrichFields.user_id = currentUserId;
+
+        const enrichOr = [];
+        if (sId) enrichOr.push({ session_id: sId });
+        if (phone && phone.length >= 11) enrichOr.push({ customerPhone: phone });
+        if (currentUserId) enrichOr.push({ user_id: currentUserId });
+
+        if (enrichOr.length > 0) {
+          await incCol.updateMany(
+            { $or: enrichOr, status: { $in: ['pending', 'contacted'] } },
+            { $set: enrichFields }
+          );
+        }
+      }
+
+      return res.json({
+        success: true,
+        message: 'প্রতিটি পণ্যের অসম্পূর্ণ অর্ডার আলাদাভাবে সংরক্ষিত হয়েছে',
+        count: processedDocs.length,
+        data: processedDocs[0],
+        allDocs: processedDocs
+      });
+    }
+
+    // Fallback if Mongo is disconnected
+    return res.json({
+      success: true,
+      message: 'অসম্পূর্ণ অর্ডার সংরক্ষিত (Memory Fallback)',
+      data: {
+        incomplete_order_id: 'INC-' + Date.now(),
+        customerName: name || 'অজ্ঞাত ক্রেতা',
+        customerPhone: phone || 'অপেক্ষমান',
+        status: 'pending',
+        items: formattedItems,
+        totalAmount: formattedItems.reduce((s, it) => s + (it.price * it.quantity), 0) + calculatedDelivery,
+        createdAt: now.toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('Save incomplete order error:', error);
+    res.status(500).json({ success: false, message: 'অসম্পূর্ণ অর্ডার সেভ করতে ত্রুটি', error: error.message });
+  }
+});
+
+// GET /api/incomplete-orders - Fetch incomplete orders with filters & stats
+app.get('/api/incomplete-orders', async (req, res) => {
+  try {
+    const { status, search, limit = 200 } = req.query;
+
+    if (isMongoConnected && db) {
+      const incCol = db.collection('incomplete_orders');
+
+      const filter = {};
+      if (status && status !== 'all') {
+        filter.status = status;
+      }
+
+      if (search && search.trim()) {
+        const s = search.trim();
+        filter.$or = [
+          { customerName: { $regex: s, $options: 'i' } },
+          { customerPhone: { $regex: s, $options: 'i' } },
+          { customerEmail: { $regex: s, $options: 'i' } },
+          { incomplete_order_id: { $regex: s, $options: 'i' } },
+          { 'items.name': { $regex: s, $options: 'i' } }
+        ];
+      }
+
+      const list = await incCol
+        .find(filter)
+        .sort({ updatedAt: -1, createdAt: -1 })
+        .limit(Number(limit))
+        .toArray();
+
+      // Aggregate high-level statistics across all incomplete orders
+      const allDocs = await incCol.find({}).toArray();
+      const stats = {
+        total: allDocs.length,
+        pending: allDocs.filter(d => d.status === 'pending').length,
+        contacted: allDocs.filter(d => d.status === 'contacted').length,
+        recovered: allDocs.filter(d => d.status === 'recovered').length,
+        cancelled: allDocs.filter(d => d.status === 'cancelled').length,
+        potentialLostRevenue: allDocs
+          .filter(d => d.status === 'pending' || d.status === 'contacted')
+          .reduce((sum, d) => sum + (Number(d.totalAmount || 0)), 0),
+        recoveredRevenue: allDocs
+          .filter(d => d.status === 'recovered')
+          .reduce((sum, d) => sum + (Number(d.totalAmount || 0)), 0)
+      };
+
+      return res.json({
+        success: true,
+        data: list,
+        count: list.length,
+        stats
+      });
+    }
+
+    res.json({
+      success: true,
+      data: [],
+      count: 0,
+      stats: { total: 0, pending: 0, contacted: 0, recovered: 0, cancelled: 0, potentialLostRevenue: 0, recoveredRevenue: 0 }
+    });
+  } catch (error) {
+    console.error('Fetch incomplete orders error:', error);
+    res.status(500).json({ success: false, message: 'অসম্পূর্ণ অর্ডার লোড করতে ত্রুটি', error: error.message });
+  }
+});
+
+// PATCH /api/incomplete-orders/:id/status - Update Status ('contacted', 'recovered', 'cancelled') & Notes
+app.patch('/api/incomplete-orders/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, adminNotes } = req.body;
+
+    if (isMongoConnected && db) {
+      const incCol = db.collection('incomplete_orders');
+      let filter = { incomplete_order_id: id };
+      if (ObjectId.isValid(id) && id.length === 24) {
+        filter = { $or: [{ _id: new ObjectId(id) }, { incomplete_order_id: id }] };
+      }
+
+      const updateData = {
+        updatedAt: new Date().toISOString()
+      };
+      if (status) updateData.status = status;
+      if (adminNotes !== undefined) updateData.adminNotes = adminNotes;
+      if (status === 'contacted') {
+        updateData.lastContactedAt = new Date().toISOString();
+      }
+
+      const result = await incCol.updateOne(filter, { $set: updateData });
+      if (result.matchedCount === 0) {
+        return res.status(404).json({ success: false, message: 'অসম্পূর্ণ অর্ডার খুঁজে পাওয়া যায়নি' });
+      }
+
+      const updated = await incCol.findOne(filter);
+      return res.json({ success: true, message: 'স্ট্যাটাস আপডেট সম্পন্ন হয়েছে', data: updated });
+    }
+
+    res.json({ success: true, message: 'স্ট্যাটাস আপডেট সফল' });
+  } catch (error) {
+    console.error('Update incomplete order status error:', error);
+    res.status(500).json({ success: false, message: 'স্ট্যাটাস আপডেট করতে ত্রুটি', error: error.message });
+  }
+});
+
+// POST /api/incomplete-orders/:id/convert - Convert Incomplete Order directly to Real Order
+app.post('/api/incomplete-orders/:id/convert', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { customNotes } = req.body;
+
+    if (isMongoConnected && db) {
+      const incCol = db.collection('incomplete_orders');
+      const ordersCol = db.collection('orders');
+
+      let filter = { incomplete_order_id: id };
+      if (ObjectId.isValid(id) && id.length === 24) {
+        filter = { $or: [{ _id: new ObjectId(id) }, { incomplete_order_id: id }] };
+      }
+
+      const incDoc = await incCol.findOne(filter);
+      if (!incDoc) {
+        return res.status(404).json({ success: false, message: 'অসম্পূর্ণ অর্ডার খুঁজে পাওয়া যায়নি' });
+      }
+
+      const now = new Date();
+      const orderId = 'ORD-' + Math.floor(100000 + Math.random() * 900000);
+
+      const initialLog = {
+        status: 'Confirmed',
+        timestamp: now.toISOString(),
+        note: `এডমিন অসম্পূর্ণ অর্ডার (${incDoc.incomplete_order_id}) থেকে সরাসরি পূর্ণাঙ্গ অর্ডারে রূপান্তর করেছেন। ${customNotes || ''}`.trim()
+      };
+
+      const newOrder = {
+        orderId,
+        order_id: orderId,
+        customer_id: incDoc.user_id || null,
+        customerName: incDoc.customerName && incDoc.customerName !== 'অজ্ঞাত ক্রেতা (Guest)' ? incDoc.customerName : 'ফোন মারফত নিশ্চিত ক্রেতা',
+        customerPhone: incDoc.customerPhone && incDoc.customerPhone !== 'নম্বর দেয়নি / অপেক্ষমান' ? incDoc.customerPhone : '01700000000',
+        customerEmail: incDoc.customerEmail || '',
+        customerAvatar: incDoc.customerAvatar || '',
+        deliveryAddress: incDoc.deliveryAddress || 'ফোন কলের মাধ্যমে বিস্তারিত ডেলিভারি ঠিকানা নিশ্চিত করা হয়েছে',
+        shippingAddress: incDoc.deliveryAddress || 'ফোন কলের মাধ্যমে বিস্তারিত ডেলিভারি ঠিকানা নিশ্চিত করা হয়েছে',
+        deliveryZone: incDoc.deliveryZone || 'inside_dhaka',
+        deliveryCharge: Number(incDoc.deliveryCharge) || 70,
+        subtotal: Number(incDoc.subtotal) || 0,
+        totalAmount: Number(incDoc.totalAmount) || 0,
+        paymentMethod: 'COD',
+        paymentStatus: 'Pending',
+        status: 'Confirmed',
+        notes: `[Incomplete Order Recovered: ${incDoc.incomplete_order_id}] ${customNotes || ''}`.trim(),
+        items: incDoc.items || [],
+        order_status_logs: [initialLog],
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString()
+      };
+
+      const insertResult = await ordersCol.insertOne(newOrder);
+      newOrder._id = insertResult.insertedId;
+      newOrder.id = insertResult.insertedId.toString();
+
+      // Mark incomplete order as recovered
+      await incCol.updateOne(filter, {
+        $set: {
+          status: 'recovered',
+          convertedOrderId: orderId,
+          convertedAt: now.toISOString(),
+          adminNotes: `সরাসরি অর্ডার ${orderId}-এ রূপান্তরিত হয়েছে।`,
+          updatedAt: now.toISOString()
+        }
+      });
+
+      // Create Admin Notification
+      const notifCol = db.collection('notifications');
+      await notifCol.insertOne({
+        recipient_role: 'admin',
+        title: '🎉 অসম্পূর্ণ অর্ডার সফলভাবে রিকভার হয়েছে!',
+        title_en: '🎉 Incomplete Order Successfully Recovered!',
+        message: `কাস্টমার ${newOrder.customerName} (ফোন: ${newOrder.customerPhone}) এর অসম্পূর্ণ অর্ডারটি পূর্ণাঙ্গ অর্ডারে (${orderId}) রূপান্তরিত হয়েছে। মোট: ৳${newOrder.totalAmount}`,
+        message_en: `Customer ${newOrder.customerName}'s incomplete order was converted to real order ${orderId}. Total: ৳${newOrder.totalAmount}`,
+        orderId,
+        order_id: orderId,
+        type: 'new_order',
+        link: '/admin',
+        is_read: false,
+        createdAt: now.toISOString()
+      });
+
+      return res.json({
+        success: true,
+        message: `অর্ডার ${orderId} সফলভাবে তৈরি ও রিকভার করা হয়েছে!`,
+        orderId,
+        order: newOrder
+      });
+    }
+
+    res.json({ success: true, message: 'অর্ডার রূপান্তরিত (Fallback)' });
+  } catch (error) {
+    console.error('Convert incomplete order error:', error);
+    res.status(500).json({ success: false, message: 'অর্ডার রূপান্তর করতে সমস্যা হয়েছে', error: error.message });
+  }
+});
+
+// DELETE /api/incomplete-orders/:id - Delete Incomplete Order
+app.delete('/api/incomplete-orders/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (isMongoConnected && db) {
+      const incCol = db.collection('incomplete_orders');
+      let filter = { incomplete_order_id: id };
+      if (ObjectId.isValid(id) && id.length === 24) {
+        filter = { $or: [{ _id: new ObjectId(id) }, { incomplete_order_id: id }] };
+      }
+      await incCol.deleteOne(filter);
+      return res.json({ success: true, message: 'অসম্পূর্ণ অর্ডারটি মুছে ফেলা হয়েছে' });
+    }
+
+    res.json({ success: true, message: 'মুছে ফেলা হয়েছে' });
+  } catch (error) {
+    console.error('Delete incomplete order error:', error);
+    res.status(500).json({ success: false, message: 'মুছে ফেলতে ত্রুটি হয়েছে', error: error.message });
+  }
+});
+
 
 module.exports = app;
