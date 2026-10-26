@@ -4520,4 +4520,273 @@ app.delete('/api/incomplete-orders/:id', async (req, res) => {
 });
 
 
+
+// =========================================================================
+// 🤖 AI AUTO SHOPPING ASSISTANT & PRODUCT ADVISOR (CONNECTED TO MONGODB)
+// =========================================================================
+
+// POST /api/ai-chat - Process user queries regarding products, pricing, recommendations, delivery & store policies
+app.post('/api/ai-chat', async (req, res) => {
+  try {
+    const { message, sessionId, userId, userName, lang = 'bn' } = req.body || {};
+
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'মেসেজ প্রদান করা আবশ্যক (Message is required)'
+      });
+    }
+
+    const trimmedMsg = message.trim();
+    const lowerMsg = trimmedMsg.toLowerCase();
+    const database = await getDb();
+    const sId = sessionId || ('ai_sess_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8));
+
+    let products = [];
+    if (database) {
+      try {
+        products = await database.collection('products').find({}).toArray();
+      } catch (err) {
+        console.error('AI chat failed to fetch products from mongo:', err);
+      }
+    }
+
+    // Default products fallback if mongo has none
+    if (!products || products.length === 0) {
+      products = INITIAL_PRODUCTS || [];
+    }
+
+    // 1. Keyword Extraction & Relevance Scoring
+    const keywordGroups = [
+      { terms: ['মধু', 'honey', 'খলিসা', 'kholisa', 'সুন্দরবন', 'sundarban'], category: 'honey' },
+      { terms: ['ঘি', 'ghee', 'গাওয়া', 'গরু', 'cow ghee', 'butter'], category: 'ghee' },
+      { terms: ['তেল', 'oil', 'সরিষা', 'mustard', 'ঘানি', 'cold pressed'], category: 'oil' },
+      { terms: ['খেজুর', 'date', 'dates', 'আজওয়া', 'ajwa', 'মদিনা', 'madinah'], category: 'dates' },
+      { terms: ['চিয়া', 'chia', 'সিড', 'seeds', 'seed'], category: 'chia' },
+      { terms: ['বাদাম', 'nut', 'nuts', 'কাজু', 'পেস্তা', 'কাঠবাদাম', 'almond', 'cashew'], category: 'nuts' },
+      { terms: ['কালোজিরা', 'black seed', 'kalijira', 'nigella'], category: 'kalijira' },
+      { terms: ['ফ্যাশন', 'fashion', 'পোশাক', 'শাড়ি', 'dress', 'silk'], category: 'fashion' },
+      { terms: ['বেকরি', 'cake', 'কেক', 'bakery'], category: 'bakery' },
+      { terms: ['কম্পিউটার', 'mouse', 'keyboard', 'gaming'], category: 'computer' },
+      { terms: ['মোবাইল', 'phone', 'case', 'cover'], category: 'mobile' }
+    ];
+
+    let matchedProducts = [];
+
+    for (const group of keywordGroups) {
+      const hasTerm = group.terms.some(t => lowerMsg.includes(t));
+      if (hasTerm) {
+        const groupMatches = products.filter(p => {
+          const pName = (p.name || '').toLowerCase();
+          const pNameBn = (p.name_bn || '').toLowerCase();
+          const pNameEn = (p.nameEn || p.name_en || '').toLowerCase();
+          const pDesc = (p.description || '').toLowerCase();
+          const pCat = (p.category || p.categorySlug || '').toLowerCase();
+
+          return group.terms.some(t =>
+            pName.includes(t) || pNameBn.includes(t) || pNameEn.includes(t) || pDesc.includes(t) || pCat.includes(t)
+          );
+        });
+        matchedProducts.push(...groupMatches);
+      }
+    }
+
+    if (matchedProducts.length === 0) {
+      matchedProducts = products.filter(p => {
+        const pName = (p.name || '').toLowerCase();
+        const pNameBn = (p.name_bn || '').toLowerCase();
+        const pNameEn = (p.nameEn || p.name_en || '').toLowerCase();
+        const pDesc = (p.description || '').toLowerCase();
+        const pCat = (p.category || p.categorySlug || '').toLowerCase();
+
+        const words = lowerMsg.split(/\s+/).filter(w => w.length > 2);
+        return words.some(w => pName.includes(w) || pNameBn.includes(w) || pNameEn.includes(w) || pDesc.includes(w) || pCat.includes(w));
+      });
+    }
+
+    const uniqueMap = new Map();
+    matchedProducts.forEach(p => {
+      const idKey = (p._id ? p._id.toString() : p.id) || p.slug;
+      if (!uniqueMap.has(idKey)) uniqueMap.set(idKey, p);
+    });
+    matchedProducts = Array.from(uniqueMap.values());
+
+    // 2. Intent Detection
+    const isPriceQuery = /দাম|মূল্য|কত|price|cost|টাকা|দর|রেট/i.test(lowerMsg);
+    const isDeliveryQuery = /ডেলিভারি|delivery|shipping|চার্জ|কুরিয়ার|পৌঁছ|সময়|কবে পাব/i.test(lowerMsg);
+    const isPaymentQuery = /পেমেন্ট|payment|টাকা দেওয়া|ক্যাশ অন ডেলিভারি|cod|বিকাশ|bkash|নগদ/i.test(lowerMsg);
+    const isOrderQuery = /অর্ডার|order|কীভাবে কিনব|কিভাবে কিনব|কিনতে চাই|প্রক্রিয়া|buy/i.test(lowerMsg);
+    const isPurityQuery = /খাঁটি|প্রাকৃতিক|অরিজিনাল|অরজিনাল|pure|organic|ভেজাল|ল্যাব|টেস্ট|কোয়ালিটি/i.test(lowerMsg);
+    const isTrackingQuery = /ট্র্যাক|ট্র্যাকিং|track|কোথায়|অবস্থা|status/i.test(lowerMsg);
+    const isContactQuery = /যোগাযোগ|ফোন|নাম্বার|মোবাইল|hotline|কল|কথা/i.test(lowerMsg);
+    const isGreeting = /হাই|হ্যালো|সালাম|আসসালামু|hello|hi|hey|good morning|শুভ/i.test(lowerMsg);
+    const isAllProductsQuery = /সব পণ্য|সকল পণ্য|সেরা পণ্য|বেস্টসেলার|তালিকা|all products|catalog|list/i.test(lowerMsg);
+
+    let reply = '';
+    let quickReplies = [];
+
+    if (isGreeting && !isPriceQuery && matchedProducts.length === 0) {
+      reply = 'আসসালামু আলাইকুম! ইহসান অনলাইন শপের AI শপিং অ্যাসিস্ট্যান্টে আপনাকে স্বাগতম। 🌿\n\nআমাদের কাছে সুন্দরবনের খাঁটি কাঁচা মধু, কাঠের ঘানি ভাঙা সরিষার তেল, দেশি গাওয়া ঘি, মদিনার প্রিমিয়াম আজওয়া খেজুর এবং অর্গানিক চিয়া সিডসহ খাঁটি অর্গানিক খাদ্য রয়েছে।\n\nকোন পণ্য সম্পর্কে জানতে চান? যেমন: "মধুর দাম কত?", "ঘি কি খাঁটি?", বা "ডেলিভারি চার্জ কত?" লিখে জিজ্ঞেস করতে পারেন!';
+      quickReplies = ['🍯 খাঁটি মধুর দাম কত?', '🧈 গাওয়া ঘি ও সরিষার তেল', '🚚 ডেলিভারি চার্জ কত?', '📦 অর্ডার কিভাবে করব?'];
+      matchedProducts = products.filter(p => p.isFeatured || p.isBestSeller).slice(0, 3);
+    } else if (isDeliveryQuery) {
+      reply = '🚚 **ইহসান অনলাইন শপের ডেলিভারি তথ্য:**\n\n• **ঢাকার ভেতরে:** ডেলিভারি চার্জ মাত্র **৭০ টাকা** (২৪ থেকে ৪৮ ঘণ্টার মধ্যে দ্রুত হোম ডেলিভারি)।\n• **ঢাকার বাইরে ও সারাদেশে:** ডেলিভারি চার্জ **১২০ টাকা** (২ থেকে ৩ কার্যদিবসের মধ্যে হোম ডেলিভারি)।\n• **ক্যাশ অন ডেলিভারি:** পণ্য হাতে পেয়ে দেখে মূল্য পরিশোধ করার সম্পূর্ণ নিরাপদ সুবিধা রয়েছে!';
+      quickReplies = ['📦 অর্ডার কিভাবে করব?', '🍯 খাঁটি মধুর দাম কত?', '📞 কাস্টমার কেয়ার নম্বর'];
+    } else if (isPaymentQuery) {
+      reply = '💳 **পেমেন্ট পদ্ধতি:**\n\n১. **ক্যাশ অন ডেলিভারি (Cash on Delivery):** পণ্য হাতে পেয়ে ডেলিভারিম্যানের কাছে মূল্য পরিশোধ করতে পারবেন।\n২. **বিকাশ (bKash):** চেকআউট বা ফাস্ট অর্ডারে সহজে বিকাশ পেমেন্ট সুবিধা রয়েছে।\n\nআপনার কেনাকাটা শতভাগ নিরাপদ ও ঝুঁকিমুক্ত!';
+      quickReplies = ['🚚 ডেলিভারি চার্জ কত?', '🌿 পণ্যের নিশ্চয়তা কি?', '🛍️ সেরা পণ্যসমূহ'];
+    } else if (isOrderQuery && matchedProducts.length === 0) {
+      reply = '📦 **অর্ডার করার সহজ নিয়ম:**\n\n১. আপনার পছন্দের পণ্যের নিচে **"১-ক্লিক ফাস্ট অর্ডার"** বাটনে ক্লিক করুন।\n২. আপনার নাম, মোবাইল নম্বর এবং সম্পূর্ণ ডেলিভারি ঠিকানা দিয়ে "অর্ডার কনফার্ম করুন"-এ চাপ দিন।\n৩. এছাড়া হটলাইনে সরাসরি কল করেও অর্ডার করতে পারেন: **09611-562080**।';
+      quickReplies = ['🍯 সুন্দরবন মধু', '🧈 খাঁটি গাওয়া ঘি', '🌴 মদিনার আজওয়া খেজুর'];
+      matchedProducts = products.slice(0, 3);
+    } else if (isTrackingQuery) {
+      reply = '📦 **অর্ডার ট্র্যাক করার নিয়ম:**\n\nআমাদের ওয়েবসাইটের **[অর্ডার ট্র্যাকিং পেজে](/track-order)** গিয়ে আপনার অর্ডার আইডি (যেমন: GB-123456) অথবা অর্ডার করার সময় ব্যবহৃত মোবাইল নম্বরটি লিখলেই আপনার পার্সেলের রিয়েল-টাইম স্ট্যাটাস দেখতে পাবেন!';
+      quickReplies = ['📦 ট্র্যাকিং পেজে যান', '📞 কাস্টমার কেয়ার', '🛍️ আরও পণ্য দেখুন'];
+    } else if (isContactQuery) {
+      reply = '📞 **যোগাযোগ ও কাস্টমার সাপোর্ট:**\n\n• **হটলাইন / কল সেন্টার:** 09611-562080 (সকাল ৯:০০টা - রাত ১০:০০টা)\n• **ইমেইল:** support@ihsan.com.bd\n• যেকোনো প্রয়োজনে আমাদের হটলাইনে সরাসরি কল করতে পারেন, আমাদের প্রতিনিধি আপনাকে সহায়তা করবেন।';
+      quickReplies = ['🚚 ডেলিভারি চার্জ কত?', '🍯 মধুর দাম কত?', '📦 অর্ডার কিভাবে করব?'];
+    } else if (isPurityQuery && matchedProducts.length === 0) {
+      reply = '🌿 **শতভাগ খাঁটি ও নিরাপদ অর্গানিক পণ্যের নিশ্চয়তা:**\n\nইহসান অনলাইন শপের প্রতিটি পণ্য সরাসরি উৎস থেকে সংগৃহীত:\n• সুন্দরবনের মৌয়ালদের থেকে সরাসরি সংগৃহীত কাঁচা মধু (ল্যাব টেস্টেড ও চিনিমুক্ত)।\n• খাঁটি গরুর দুধের ননী থেকে প্রস্তুত সুগন্ধি গাওয়া ঘি।\n• কাঠের ঘানিতে কম তাপে ভাঙানো ঝাঁজালো প্রথম চাপের সরিষার তেল।\n\nপণ্যে কোনো কৃত্রিম উপাদান বা প্রিজারভেটিভ নেই। ভেজাল প্রমাণে ১০০% মানিব্যাক গ্যারান্টি!';
+      quickReplies = ['🍯 সুন্দরবন খলিসা মধু', '🧈 খাঁটি গাওয়া ঘি', '🛢️ সরিষার তেল'];
+      matchedProducts = products.slice(0, 3);
+    } else if (isAllProductsQuery || (matchedProducts.length === 0 && !isPriceQuery)) {
+      reply = 'আমাদের স্টোরে বর্তমানে বেশ কিছু জনপ্রিয় অর্গানিক ও প্রিমিয়াম খাদ্য রয়েছে। নিচে কয়েকটি সেরা পণ্য দেওয়া হলো:';
+      matchedProducts = products.slice(0, 4);
+      quickReplies = ['🍯 মধুর দাম কত?', '🧈 গাওয়া ঘি এর দাম', '🚚 ডেলিভারি চার্জ কত?'];
+    } else {
+      const count = matchedProducts.length;
+      const topProd = matchedProducts[0];
+      const regularPriceText = topProd.regularPrice ? ` (পূর্বের মূল্য: ৳${topProd.regularPrice})` : '';
+
+      if (isPriceQuery) {
+        if (count === 1) {
+          reply = `✨ **${topProd.name || topProd.name_bn}:**\n\n• **অফার মূল্য:** **৳ ${topProd.price}**${regularPriceText}\n• **পরিমাণ/প্যাক:** ${topProd.unit || '১ কেজি / ৫০০ গ্রাম'}\n• **স্টক অবস্থা:** ${Number(topProd.stock_quantity ?? topProd.stock ?? 50) > 0 ? '✅ স্টকে আছে (ইন স্টক)' : '⚠️ সীমিত স্টক'}\n\nসরাসরি অর্ডার করতে নিচের পণ্য কার্ডের **"১-ক্লিক অর্ডার"** বাটনে চাপ দিন!`;
+        } else {
+          reply = `আমাদের কাছে এই সংক্রান্ত ${count}টি পণ্য রয়েছে:\n\n` +
+            matchedProducts.slice(0, 3).map((p, idx) => `${idx + 1}. **${p.name || p.name_bn}** — ৳${p.price} (${p.unit || 'স্ট্যান্ডার্ড প্যাক'})`).join('\n') +
+            `\n\nনিচের কার্ড থেকে সরাসরি পছন্দমতো পণ্য অর্ডার করতে পারবেন:`;
+        }
+      } else {
+        reply = `আমাদের কাছে **${topProd.name || topProd.name_bn}** রয়েছে। এটি ১০০% খাঁটি ও স্বাস্থ্যসম্মত।\n\n• **মূল্য:** ৳${topProd.price}${regularPriceText}\n• **স্টক:** ${Number(topProd.stock_quantity ?? topProd.stock ?? 50) > 0 ? 'ইন স্টক' : 'সীমিত স্টক'}\n\nনিচের কার্ড থেকে সরাসরি অর্ডার করুন:`;
+      }
+
+      quickReplies = ['🚚 ডেলিভারি চার্জ কত?', '💳 পেমেন্ট কিভাবে করব?', '📞 কাস্টমার কেয়ারে কল দিন'];
+    }
+
+    const suggestedProducts = matchedProducts.slice(0, 4).map(p => {
+      const doc = formatDoc(p) || p;
+      return {
+        id: doc.id || doc._id,
+        _id: doc._id || doc.id,
+        name: doc.name || doc.name_bn,
+        name_bn: doc.name_bn || doc.name,
+        nameEn: doc.nameEn || doc.name_en || doc.name,
+        price: Number(doc.price) || 0,
+        regularPrice: Number(doc.regularPrice || doc.regular_price || doc.price) || 0,
+        discountPercentage: doc.discountPercentage || 0,
+        thumbnail: doc.thumbnail || (Array.isArray(doc.images) && doc.images[0]) || '',
+        images: doc.images || (doc.thumbnail ? [doc.thumbnail] : []),
+        slug: doc.slug || doc.id || doc._id,
+        stock: doc.stock_quantity ?? doc.stock ?? 50,
+        unit: doc.unit || '১ কেজি'
+      };
+    });
+
+    if (database) {
+      try {
+        await database.collection('ai_chat_messages').insertOne({
+          sessionId: sId,
+          session_id: sId,
+          userId: userId || null,
+          userName: userName || 'অতিথি',
+          userMessage: trimmedMsg,
+          aiReply: reply,
+          suggestedProducts: suggestedProducts.map(p => ({
+            id: p.id,
+            name: p.name,
+            price: p.price,
+            thumbnail: p.thumbnail,
+            slug: p.slug
+          })),
+          createdAt: new Date().toISOString()
+        });
+      } catch (logErr) {
+        console.error('Failed to log AI chat in MongoDB:', logErr.message);
+      }
+    }
+
+    return res.json({
+      success: true,
+      sessionId: sId,
+      reply,
+      suggestedProducts,
+      quickReplies
+    });
+
+  } catch (error) {
+    console.error('AI chat endpoint error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'AI সার্ভারে ত্রুটি হয়েছে',
+      error: error.message
+    });
+  }
+});
+
+// GET /api/ai-chat/history - Retrieve past chat history for this user / session
+app.get('/api/ai-chat/history', async (req, res) => {
+  try {
+    const { sessionId, session_id, limit = 50 } = req.query;
+    const targetSession = (sessionId || session_id || '').trim();
+
+    if (!targetSession) {
+      return res.json({ success: true, history: [] });
+    }
+
+    const database = await getDb();
+    if (database) {
+      const messages = await database.collection('ai_chat_messages')
+        .find({ $or: [{ sessionId: targetSession }, { session_id: targetSession }] })
+        .sort({ createdAt: 1 })
+        .limit(Number(limit))
+        .toArray();
+
+      return res.json({
+        success: true,
+        history: messages
+      });
+    }
+
+    res.json({ success: true, history: [] });
+  } catch (error) {
+    console.error('Get AI chat history error:', error);
+    res.status(500).json({ success: false, message: 'চ্যাট হিস্ট্রি লোড করতে ব্যর্থ হয়েছে', error: error.message });
+  }
+});
+
+// DELETE /api/ai-chat/history - Clear past chat history for session
+app.delete('/api/ai-chat/history', async (req, res) => {
+  try {
+    const { sessionId, session_id } = req.query;
+    const targetSession = (sessionId || session_id || '').trim();
+
+    if (!targetSession) {
+      return res.json({ success: true, message: 'Session ID required' });
+    }
+
+    const database = await getDb();
+    if (database) {
+      await database.collection('ai_chat_messages').deleteMany({
+        $or: [{ sessionId: targetSession }, { session_id: targetSession }]
+      });
+    }
+
+    res.json({ success: true, message: 'চ্যাট হিস্ট্রি সফলভাবে মোছা হয়েছে' });
+  } catch (error) {
+    console.error('Clear AI chat history error:', error);
+    res.status(500).json({ success: false, message: 'চ্যাট মুছতে ব্যর্থ হয়েছে', error: error.message });
+  }
+});
+
 module.exports = app;
+
