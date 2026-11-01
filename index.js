@@ -264,7 +264,8 @@ const memoryDb = {
   sellers: [...INITIAL_SELLERS],
   popup: { ...INITIAL_POPUP },
   orders: [],
-  reviews: []
+  reviews: [],
+  wishlists: []
 };
 
 // Database Connection
@@ -4612,6 +4613,361 @@ app.delete('/api/ai-chat/history', async (req, res) => {
   } catch (error) {
     console.error('Clear AI chat history error:', error);
     res.status(500).json({ success: false, message: 'চ্যাট মুছতে ব্যর্থ হয়েছে', error: error.message });
+  }
+});
+
+// =========================================================================
+// 💖 WISHLIST API ENDPOINTS (MongoDB Connected & Synced)
+// =========================================================================
+
+// Helper to extract user identity from req
+function extractUserId(req) {
+  let userId = req.query.userId || req.query.user_id || req.body?.userId || req.body?.user_id;
+  if (!userId && req.headers.authorization) {
+    try {
+      const token = req.headers.authorization.replace('Bearer ', '');
+      const decoded = jwt.verify(token, JWT_SECRET);
+      userId = decoded.id || decoded._id || decoded.userId;
+    } catch (e) {}
+  }
+  return userId ? String(userId).trim() : null;
+}
+
+// 1. GET /api/wishlist - Get personal wishlist for a user
+app.get('/api/wishlist', async (req, res) => {
+  try {
+    const userId = extractUserId(req);
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'ইউজার আইডি প্রয়োজন', data: [], total: 0 });
+    }
+
+    const database = await getDb();
+    if (database) {
+      const col = database.collection('wishlists');
+      const orCond = [
+        { userId: userId },
+        { user_id: userId }
+      ];
+      if (ObjectId.isValid(userId)) {
+        orCond.push({ userId: new ObjectId(userId) }, { user_id: new ObjectId(userId) });
+      }
+
+      const items = await col.find({ $or: orCond }).sort({ createdAt: -1 }).toArray();
+      const formatted = items.map(item => ({
+        id: item._id ? item._id.toString() : item.id,
+        _id: item._id ? item._id.toString() : item.id,
+        userId: String(item.userId || item.user_id || userId),
+        productId: String(item.productId || item.product_id || item.product?.id || item.product?._id || ''),
+        product: item.product || null,
+        createdAt: item.createdAt || new Date()
+      }));
+
+      return res.json({
+        success: true,
+        total: formatted.length,
+        count: formatted.length,
+        data: formatted
+      });
+    }
+
+    // In-memory fallback
+    const items = memoryDb.wishlists.filter(w => String(w.userId) === String(userId) || String(w.user_id) === String(userId));
+    res.json({
+      success: true,
+      total: items.length,
+      count: items.length,
+      data: items
+    });
+  } catch (error) {
+    console.error('Fetch wishlist error:', error);
+    res.status(500).json({ success: false, message: 'পছন্দের তালিকা লোড করতে সমস্যা হয়েছে', error: error.message });
+  }
+});
+
+// 2. POST /api/wishlist - Add product to personal wishlist
+app.post('/api/wishlist', async (req, res) => {
+  try {
+    const userId = extractUserId(req);
+    const { productId, product: rawProduct } = req.body || {};
+    const targetProdId = String(productId || rawProduct?.id || rawProduct?._id || rawProduct?.slug || '').trim();
+
+    if (!userId || !targetProdId) {
+      return res.status(400).json({ success: false, message: 'ইউজার ও পণ্যের তথ্য আবশ্যক' });
+    }
+
+    const database = await getDb();
+    let productData = rawProduct;
+
+    // Fetch product details if not provided in payload
+    if (!productData && database) {
+      let foundProd = null;
+      if (ObjectId.isValid(targetProdId)) {
+        foundProd = await database.collection('products').findOne({ _id: new ObjectId(targetProdId) });
+      }
+      if (!foundProd) {
+        foundProd = await database.collection('products').findOne({
+          $or: [{ id: targetProdId }, { slug: targetProdId }]
+        });
+      }
+      if (foundProd) productData = formatDoc(foundProd);
+    }
+
+    const finalProduct = {
+      id: productData?.id || productData?._id || targetProdId,
+      _id: productData?._id || productData?.id || targetProdId,
+      name: productData?.name || productData?.name_bn || 'পণ্য',
+      name_bn: productData?.name_bn || productData?.name || '',
+      name_en: productData?.name_en || productData?.nameEn || '',
+      nameEn: productData?.nameEn || productData?.name_en || '',
+      slug: productData?.slug || targetProdId,
+      price: Number(productData?.price) || 0,
+      regularPrice: Number(productData?.regularPrice || productData?.regular_price || productData?.price) || 0,
+      discountPercentage: Number(productData?.discountPercentage) || 0,
+      thumbnail: productData?.thumbnail || (Array.isArray(productData?.images) ? productData.images[0] : '') || '',
+      images: Array.isArray(productData?.images) ? productData.images : (productData?.thumbnail ? [productData.thumbnail] : []),
+      category: productData?.category || '',
+      categorySlug: productData?.categorySlug || '',
+      stock: Number(productData?.stock_quantity ?? productData?.stock ?? 50),
+      stock_quantity: Number(productData?.stock_quantity ?? productData?.stock ?? 50),
+      unit: productData?.unit || 'স্ট্যান্ডার্ড',
+      seller_name: productData?.seller_name || productData?.shop_name || 'সুন্দরবন অর্গানিক ফার্মস'
+    };
+
+    if (database) {
+      const col = database.collection('wishlists');
+      const orCond = [
+        { userId: userId, productId: targetProdId },
+        { user_id: userId, productId: targetProdId },
+        { userId: userId, 'product.id': targetProdId },
+        { userId: userId, 'product.slug': targetProdId }
+      ];
+
+      const existing = await col.findOne({ $or: orCond });
+      if (existing) {
+        return res.json({
+          success: true,
+          inWishlist: true,
+          message: 'পণ্যটি ইতিমধ্যে পছন্দের তালিকায় রয়েছে!',
+          data: {
+            id: existing._id ? existing._id.toString() : existing.id,
+            userId,
+            productId: targetProdId,
+            product: existing.product || finalProduct
+          }
+        });
+      }
+
+      const newWishDoc = {
+        userId: String(userId),
+        user_id: String(userId),
+        productId: targetProdId,
+        product: finalProduct,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const result = await col.insertOne(newWishDoc);
+      const insertedItem = {
+        id: result.insertedId.toString(),
+        _id: result.insertedId.toString(),
+        ...newWishDoc
+      };
+
+      return res.status(201).json({
+        success: true,
+        inWishlist: true,
+        message: 'পছন্দের তালিকায় সফলভাবে যুক্ত হয়েছে! ❤️',
+        data: insertedItem
+      });
+    }
+
+    // In-memory fallback
+    const exists = memoryDb.wishlists.find(w => String(w.userId) === String(userId) && (w.productId === targetProdId || w.product?.id === targetProdId));
+    if (exists) {
+      return res.json({ success: true, inWishlist: true, message: 'পণ্যটি ইতিমধ্যে রয়েছে', data: exists });
+    }
+
+    const item = {
+      id: 'w_' + Date.now(),
+      _id: 'w_' + Date.now(),
+      userId,
+      user_id: userId,
+      productId: targetProdId,
+      product: finalProduct,
+      createdAt: new Date()
+    };
+    memoryDb.wishlists.unshift(item);
+
+    res.status(201).json({
+      success: true,
+      inWishlist: true,
+      message: 'পছন্দের তালিকায় যুক্ত হয়েছে! ❤️',
+      data: item
+    });
+  } catch (error) {
+    console.error('Add to wishlist error:', error);
+    res.status(500).json({ success: false, message: 'পছন্দের তালিকায় যুক্ত করতে সমস্যা হয়েছে', error: error.message });
+  }
+});
+
+// 3. POST /api/wishlist/toggle - Toggle in/out of wishlist
+app.post('/api/wishlist/toggle', async (req, res) => {
+  try {
+    const userId = extractUserId(req);
+    const { productId, product: rawProduct } = req.body || {};
+    const targetProdId = String(productId || rawProduct?.id || rawProduct?._id || rawProduct?.slug || '').trim();
+
+    if (!userId || !targetProdId) {
+      return res.status(400).json({ success: false, message: 'ইউজার ও পণ্যের তথ্য আবশ্যক' });
+    }
+
+    const database = await getDb();
+    if (database) {
+      const col = database.collection('wishlists');
+      const orCond = [
+        { userId: userId, productId: targetProdId },
+        { user_id: userId, productId: targetProdId },
+        { userId: userId, 'product.id': targetProdId },
+        { userId: userId, 'product.slug': targetProdId }
+      ];
+
+      const existing = await col.findOne({ $or: orCond });
+      if (existing) {
+        await col.deleteOne({ _id: existing._id });
+        return res.json({
+          success: true,
+          inWishlist: false,
+          message: 'পছন্দের তালিকা থেকে সরানো হয়েছে 💔',
+          productId: targetProdId
+        });
+      }
+
+      // Add to wishlist
+      let productData = rawProduct;
+      if (!productData) {
+        let found = null;
+        if (ObjectId.isValid(targetProdId)) found = await database.collection('products').findOne({ _id: new ObjectId(targetProdId) });
+        if (!found) found = await database.collection('products').findOne({ $or: [{ id: targetProdId }, { slug: targetProdId }] });
+        if (found) productData = formatDoc(found);
+      }
+
+      const finalProduct = {
+        id: productData?.id || productData?._id || targetProdId,
+        _id: productData?._id || productData?.id || targetProdId,
+        name: productData?.name || productData?.name_bn || 'পণ্য',
+        name_bn: productData?.name_bn || productData?.name || '',
+        name_en: productData?.name_en || productData?.nameEn || '',
+        slug: productData?.slug || targetProdId,
+        price: Number(productData?.price) || 0,
+        regularPrice: Number(productData?.regularPrice || productData?.regular_price || productData?.price) || 0,
+        discountPercentage: Number(productData?.discountPercentage) || 0,
+        thumbnail: productData?.thumbnail || (Array.isArray(productData?.images) ? productData.images[0] : '') || '',
+        images: Array.isArray(productData?.images) ? productData.images : (productData?.thumbnail ? [productData.thumbnail] : []),
+        category: productData?.category || '',
+        stock: Number(productData?.stock_quantity ?? productData?.stock ?? 50),
+        unit: productData?.unit || 'স্ট্যান্ডার্ড'
+      };
+
+      const newWishDoc = {
+        userId: String(userId),
+        user_id: String(userId),
+        productId: targetProdId,
+        product: finalProduct,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const result = await col.insertOne(newWishDoc);
+      return res.json({
+        success: true,
+        inWishlist: true,
+        message: 'পছন্দের তালিকায় যুক্ত হয়েছে! ❤️',
+        data: { id: result.insertedId.toString(), _id: result.insertedId.toString(), ...newWishDoc }
+      });
+    }
+
+    // In-memory toggle
+    const idx = memoryDb.wishlists.findIndex(w => String(w.userId) === String(userId) && (w.productId === targetProdId || w.product?.id === targetProdId));
+    if (idx !== -1) {
+      memoryDb.wishlists.splice(idx, 1);
+      return res.json({ success: true, inWishlist: false, message: 'পছন্দের তালিকা থেকে সরানো হয়েছে 💔', productId: targetProdId });
+    }
+
+    const item = {
+      id: 'w_' + Date.now(),
+      _id: 'w_' + Date.now(),
+      userId,
+      user_id: userId,
+      productId: targetProdId,
+      product: rawProduct || { id: targetProdId, name: 'পণ্য', price: 0 },
+      createdAt: new Date()
+    };
+    memoryDb.wishlists.unshift(item);
+    res.json({ success: true, inWishlist: true, message: 'পছন্দের তালিকায় যুক্ত হয়েছে! ❤️', data: item });
+  } catch (error) {
+    console.error('Toggle wishlist error:', error);
+    res.status(500).json({ success: false, message: 'টগল করতে সমস্যা হয়েছে', error: error.message });
+  }
+});
+
+// 4. DELETE /api/wishlist/:id - Remove item from wishlist
+app.delete('/api/wishlist/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = extractUserId(req);
+
+    if (!id) {
+      return res.status(400).json({ success: false, message: 'পণ্য আইডি আবশ্যক' });
+    }
+
+    const database = await getDb();
+    if (database) {
+      const col = database.collection('wishlists');
+      const orCond = [
+        { productId: id },
+        { 'product.id': id },
+        { 'product.slug': id }
+      ];
+      if (ObjectId.isValid(id)) {
+        orCond.push({ _id: new ObjectId(id) });
+      }
+
+      let deleteFilter = { $or: orCond };
+      if (userId) {
+        deleteFilter = {
+          $and: [
+            { $or: [{ userId: String(userId) }, { user_id: String(userId) }] },
+            { $or: orCond }
+          ]
+        };
+      }
+
+      const result = await col.deleteOne(deleteFilter);
+      return res.json({
+        success: true,
+        inWishlist: false,
+        message: 'পছন্দের তালিকা থেকে সফলভাবে সরানো হয়েছে',
+        deletedCount: result.deletedCount
+      });
+    }
+
+    // In-memory delete
+    const prevLen = memoryDb.wishlists.length;
+    memoryDb.wishlists = memoryDb.wishlists.filter(w => {
+      const matchItem = w.id === id || w._id === id || w.productId === id || w.product?.id === id;
+      if (!matchItem) return true;
+      if (userId && String(w.userId) !== String(userId)) return true;
+      return false;
+    });
+
+    res.json({
+      success: true,
+      inWishlist: false,
+      message: 'পছন্দের তালিকা থেকে সফলভাবে সরানো হয়েছে'
+    });
+  } catch (error) {
+    console.error('Delete wishlist error:', error);
+    res.status(500).json({ success: false, message: 'মুছতে ব্যর্থ হয়েছে', error: error.message });
   }
 });
 
