@@ -726,6 +726,13 @@ const handleProductUpdate = async (req, res) => {
     const { id } = req.params;
     const raw = req.body || {};
 
+    let database = null;
+    try {
+      database = await getDb();
+    } catch (dbErr) {
+      console.warn('MongoDB getDb error, fallback to memoryDb:', dbErr.message);
+    }
+
     let images = raw.images;
     let thumbnail = raw.thumbnail;
 
@@ -753,11 +760,39 @@ const handleProductUpdate = async (req, res) => {
       updateFields.nameEn = raw.name_en;
     }
     if (raw.slug !== undefined) updateFields.slug = raw.slug;
-    if (raw.category !== undefined) updateFields.category = raw.category;
-    if (raw.categorySlug !== undefined) updateFields.categorySlug = raw.categorySlug;
-    if (raw.category_id !== undefined) updateFields.category_id = Number(raw.category_id);
+    if (raw.category !== undefined) {
+      updateFields.category = raw.category;
+      updateFields.category_name = raw.category;
+      updateFields.categoryName = raw.category;
+      updateFields.category_bn = raw.category_bn || raw.category;
+    }
+    if (raw.category_bn !== undefined) {
+      updateFields.category_bn = raw.category_bn;
+      if (!updateFields.category) updateFields.category = raw.category_bn;
+    }
+    if (raw.category_en !== undefined) updateFields.category_en = raw.category_en;
+    if (raw.categorySlug !== undefined) {
+      updateFields.categorySlug = raw.categorySlug;
+      updateFields.category_slug = raw.categorySlug;
+    }
+    if (raw.category_slug !== undefined) {
+      updateFields.category_slug = raw.category_slug;
+      if (!updateFields.categorySlug) updateFields.categorySlug = raw.category_slug;
+    }
+    if (raw.category_id !== undefined) {
+      updateFields.category_id = (!isNaN(Number(raw.category_id)) && raw.category_id !== '' && raw.category_id !== null) ? Number(raw.category_id) : raw.category_id;
+      updateFields.categoryId = updateFields.category_id;
+    }
     if (raw.price !== undefined) updateFields.price = Number(raw.price);
     if (raw.regularPrice !== undefined) updateFields.regularPrice = Number(raw.regularPrice);
+    if (raw.admin_stock !== undefined) {
+      updateFields.admin_stock = Number(raw.admin_stock);
+      updateFields.adminStock = Number(raw.admin_stock);
+    }
+    if (raw.adminStock !== undefined) {
+      updateFields.adminStock = Number(raw.adminStock);
+      if (updateFields.admin_stock === undefined) updateFields.admin_stock = Number(raw.adminStock);
+    }
     if (raw.stock !== undefined) {
       updateFields.stock = Number(raw.stock);
       updateFields.stock_quantity = Number(raw.stock);
@@ -767,6 +802,8 @@ const handleProductUpdate = async (req, res) => {
       if (updateFields.stock === undefined) updateFields.stock = Number(raw.stock_quantity);
     }
     if (raw.sku !== undefined) updateFields.sku = raw.sku;
+    if (raw.status !== undefined) updateFields.status = raw.status;
+    if (raw.is_active !== undefined) updateFields.is_active = Boolean(raw.is_active);
     if (thumbnail !== undefined) updateFields.thumbnail = thumbnail;
     if (images !== undefined) updateFields.images = Array.isArray(images) ? images : [images];
     if (raw.description !== undefined) updateFields.description = raw.description;
@@ -814,22 +851,101 @@ const handleProductUpdate = async (req, res) => {
       }
     }
 
-    if (isMongoConnected && db) {
-      let filter = null;
+    if (database) {
+      // Build robust MongoDB query filter
+      const filterConditions = [
+        { id: id },
+        { _id: id },
+        { slug: id }
+      ];
       if (ObjectId.isValid(id)) {
-        filter = { _id: new ObjectId(id) };
-      } else {
-        filter = { $or: [{ slug: id }, { id: id }] };
+        filterConditions.unshift({ _id: new ObjectId(id) });
+      }
+      if (!isNaN(Number(id))) {
+        filterConditions.push({ id: Number(id) });
+      }
+      if (raw.id && raw.id !== id) {
+        filterConditions.push({ id: raw.id });
+      }
+      if (raw._id && raw._id !== id) {
+        filterConditions.push({ _id: raw._id });
+        if (ObjectId.isValid(raw._id)) {
+          filterConditions.unshift({ _id: new ObjectId(raw._id) });
+        }
+      }
+      if (raw.slug && raw.slug !== id) {
+        filterConditions.push({ slug: raw.slug });
       }
 
-      await db.collection('products').updateOne(filter, { $set: updateFields });
+      let filter = { $or: filterConditions };
 
-      let refreshed = await db.collection('products').findOne(filter);
-      if (!refreshed && !ObjectId.isValid(id)) {
-        refreshed = await db.collection('products').findOne({ slug: id });
+      // Update product document in MongoDB
+      let updateResult = await database.collection('products').updateOne(filter, { $set: updateFields });
+
+      // Fallback search if id didn't match directly
+      if (updateResult.matchedCount === 0 && raw.name) {
+        const altFilter = { $or: [{ name: raw.name }, { name_bn: raw.name }, { name_en: raw.name }] };
+        const altRes = await database.collection('products').updateOne(altFilter, { $set: updateFields });
+        if (altRes.matchedCount > 0) {
+          filter = altFilter;
+        }
       }
+
+      let refreshed = await database.collection('products').findOne(filter);
+      if (!refreshed && id) {
+        refreshed = await database.collection('products').findOne({
+          $or: [
+            { id: id },
+            { slug: id },
+            { name: raw.name || '' }
+          ]
+        });
+      }
+
       if (!refreshed) {
         return res.status(404).json({ success: false, message: 'পণ্য খুঁজে পাওয়া যায়নি' });
+      }
+
+      // Also keep memoryDb in sync
+      const mIdx = memoryDb.products.findIndex(p => 
+        p.id === id || 
+        p._id === id || 
+        p.slug === id || 
+        (raw.name && p.name === raw.name)
+      );
+      if (mIdx !== -1) {
+        memoryDb.products[mIdx] = {
+          ...memoryDb.products[mIdx],
+          ...updateFields
+        };
+      }
+
+      // Automatically ensure updated category is synced into categories collection
+      if (updateFields.category) {
+        try {
+          const catCol = database.collection('categories');
+          const existingCat = await catCol.findOne({
+            $or: [
+              { name: updateFields.category },
+              { name_bn: updateFields.category },
+              { slug: updateFields.categorySlug }
+            ]
+          });
+          if (!existingCat) {
+            await catCol.insertOne({
+              name: updateFields.category,
+              name_bn: updateFields.category_bn || updateFields.category,
+              name_en: updateFields.category_en || updateFields.categorySlug || '',
+              slug: updateFields.categorySlug || updateFields.category.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+              icon: '🏷️',
+              image: '',
+              status: 'active',
+              createdAt: new Date()
+            });
+          }
+        } catch (catErr) {
+          console.error('Category auto-sync error in products collection:', catErr);
+        }
       }
 
       return res.json({
@@ -839,7 +955,14 @@ const handleProductUpdate = async (req, res) => {
       });
     }
 
-    const idx = memoryDb.products.findIndex(p => p.id === id || p._id === id || p.slug === id);
+    const idx = memoryDb.products.findIndex(p => 
+      p.id === id || 
+      p._id === id || 
+      p.slug === id ||
+      (raw.id && (p.id === raw.id || p._id === raw.id)) ||
+      (raw._id && (p.id === raw._id || p._id === raw._id)) ||
+      (raw.slug && p.slug === raw.slug)
+    );
     if (idx === -1) {
       return res.status(404).json({ success: false, message: 'পণ্য খুঁজে পাওয়া যায়নি' });
     }
@@ -848,6 +971,22 @@ const handleProductUpdate = async (req, res) => {
       ...memoryDb.products[idx],
       ...updateFields
     };
+
+    // Auto-sync category in memoryDb
+    if (updateFields.category) {
+      const exists = memoryDb.categories.some(c => c.name === updateFields.category || c.slug === updateFields.categorySlug);
+      if (!exists) {
+        memoryDb.categories.push({
+          id: memoryDb.categories.length + 1,
+          name: updateFields.category,
+          name_bn: updateFields.category_bn || updateFields.category,
+          name_en: updateFields.category_en || '',
+          slug: updateFields.categorySlug || updateFields.category.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+          icon: '🏷️',
+          status: 'active'
+        });
+      }
+    }
 
     res.json({
       success: true,
@@ -880,6 +1019,192 @@ app.delete('/api/products/:id', async (req, res) => {
     res.json({ success: true, message: 'পণ্য সফলভাবে মুছে ফেলা হয়েছে' });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to delete product', error: error.message });
+  }
+});
+
+// ----------------------------------------------------
+// STOCK REQUESTS & INVENTORY TRANSFER API (MongoDB)
+// ----------------------------------------------------
+
+// GET /api/stock-requests - Fetch all stock requests (with optional sellerId and status filter)
+app.get('/api/stock-requests', async (req, res) => {
+  try {
+    const { sellerId, productId, status } = req.query;
+    const currentDb = db || await getDb().catch(() => null);
+
+    if (currentDb) {
+      const query = {};
+      if (sellerId) {
+        query.$or = [
+          { sellerId: String(sellerId) },
+          { seller_id: String(sellerId) }
+        ];
+      }
+      if (productId) query.productId = String(productId);
+      if (status) query.status = status;
+
+      const requests = await currentDb.collection('stock_requests')
+        .find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .toArray();
+
+      return res.json({
+        success: true,
+        data: requests.map(formatDoc)
+      });
+    }
+
+    res.json({ success: true, data: [] });
+  } catch (error) {
+    console.error('Get stock requests error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch stock requests', error: error.message });
+  }
+});
+
+// POST /api/stock-requests - Submit new Stock Restock / Transfer Request
+app.post('/api/stock-requests', async (req, res) => {
+  try {
+    const currentDb = db || await getDb().catch(() => null);
+    const body = req.body || {};
+    const reqDoc = {
+      id: body.id || body._id || `SR-${Date.now()}`,
+      productId: body.productId,
+      productName: body.productName || 'পণ্য',
+      productNameEn: body.productNameEn || '',
+      productImage: body.productImage || '',
+      price: Number(body.price) || 0,
+      sellerId: body.sellerId || '',
+      sellerName: body.sellerName || 'সেলার',
+      requestedQty: Number(body.requestedQty) || 30,
+      adminStockAtRequest: Number(body.adminStockAtRequest) || 0,
+      sellerStockAtRequest: Number(body.sellerStockAtRequest) || 0,
+      note: body.note || '',
+      status: body.status || 'pending',
+      createdAt: body.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (currentDb) {
+      const collection = currentDb.collection('stock_requests');
+      const existing = await collection.findOne({ $or: [{ id: reqDoc.id }, { _id: reqDoc.id }] });
+      if (existing) {
+        await collection.updateOne({ _id: existing._id }, { $set: reqDoc });
+      } else {
+        await collection.insertOne({ ...reqDoc, _id: reqDoc.id });
+      }
+
+      // Also ensure it is attached inside the product document stock_requests array if productId matches
+      if (reqDoc.productId) {
+        const prodOr = [{ id: reqDoc.productId }];
+        if (ObjectId.isValid(reqDoc.productId) && reqDoc.productId.length === 24) {
+          prodOr.push({ _id: new ObjectId(reqDoc.productId) });
+        }
+        await currentDb.collection('products').updateOne(
+          { $or: prodOr },
+          { $push: { stock_requests: { $each: [reqDoc], $position: 0 } } }
+        ).catch(() => {});
+      }
+
+      return res.status(201).json({
+        success: true,
+        message: 'স্টক রিকোয়েস্ট সফলভাবে জমা হয়েছে!',
+        data: formatDoc(reqDoc)
+      });
+    }
+
+    res.status(201).json({ success: true, data: reqDoc });
+  } catch (error) {
+    console.error('Post stock request error:', error);
+    res.status(500).json({ success: false, message: 'Failed to create stock request', error: error.message });
+  }
+});
+
+// PATCH /api/stock-requests/:id/approve - Approve Stock Request
+app.patch('/api/stock-requests/:id/approve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { transferredQty, adminNote, approvedAt } = req.body;
+    const currentDb = db || await getDb().catch(() => null);
+
+    if (currentDb) {
+      const collection = currentDb.collection('stock_requests');
+      const updateData = {
+        status: 'approved',
+        ...(transferredQty !== undefined ? { transferredQty: Number(transferredQty) } : {}),
+        ...(adminNote ? { adminNote: adminNote.trim() } : {}),
+        approvedAt: approvedAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      const orCond = [{ id: id }, { _id: id }];
+      if (ObjectId.isValid(id) && id.length === 24) {
+        orCond.push({ _id: new ObjectId(id) });
+      }
+
+      await collection.updateOne({ $or: orCond }, { $set: updateData });
+
+      return res.json({ success: true, message: 'স্টক রিকোয়েস্ট অনুমোদিত হয়েছে!' });
+    }
+
+    res.json({ success: true, message: 'স্টক রিকোয়েস্ট অনুমোদিত হয়েছে!' });
+  } catch (error) {
+    console.error('Approve stock request error:', error);
+    res.status(500).json({ success: false, message: 'Failed to approve stock request', error: error.message });
+  }
+});
+
+// PATCH /api/stock-requests/:id/reject - Reject Stock Request
+app.patch('/api/stock-requests/:id/reject', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { adminNote, rejectedAt } = req.body;
+    const currentDb = db || await getDb().catch(() => null);
+
+    if (currentDb) {
+      const collection = currentDb.collection('stock_requests');
+      const updateData = {
+        status: 'rejected',
+        ...(adminNote ? { adminNote: adminNote.trim() } : {}),
+        rejectedAt: rejectedAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      const orCond = [{ id: id }, { _id: id }];
+      if (ObjectId.isValid(id) && id.length === 24) {
+        orCond.push({ _id: new ObjectId(id) });
+      }
+
+      await collection.updateOne({ $or: orCond }, { $set: updateData });
+
+      return res.json({ success: true, message: 'স্টক রিকোয়েস্ট প্রত্যাখ্যান করা হয়েছে!' });
+    }
+
+    res.json({ success: true, message: 'স্টক রিকোয়েস্ট প্রত্যাখ্যান করা হয়েছে!' });
+  } catch (error) {
+    console.error('Reject stock request error:', error);
+    res.status(500).json({ success: false, message: 'Failed to reject stock request', error: error.message });
+  }
+});
+
+// PUT /api/stock-requests/:id - General update of stock request
+app.put('/api/stock-requests/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const currentDb = db || await getDb().catch(() => null);
+    if (currentDb) {
+      const orCond = [{ id: id }, { _id: id }];
+      if (ObjectId.isValid(id) && id.length === 24) {
+        orCond.push({ _id: new ObjectId(id) });
+      }
+      await currentDb.collection('stock_requests').updateOne(
+        { $or: orCond },
+        { $set: { ...req.body, updatedAt: new Date().toISOString() } }
+      );
+      return res.json({ success: true, message: 'স্টক রিকোয়েস্ট আপডেট হয়েছে!' });
+    }
+    res.json({ success: true, message: 'স্টক রিকোয়েস্ট আপডেট হয়েছে!' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -1759,6 +2084,7 @@ app.put('/api/sellers/profile', async (req, res) => {
       commission_rate,
       balance,
       shop_logo,
+      avatar,
       shop_banner,
       shop_description,
       bank_account,
@@ -1766,10 +2092,16 @@ app.put('/api/sellers/profile', async (req, res) => {
       nagad_number
     } = req.body;
 
-    if (isMongoConnected && db) {
+    const currentDb = db || await getDb().catch(() => null);
+    if (currentDb) {
       const cleanUserId = userId ? String(userId).trim() : null;
       const cleanEmail = email ? email.trim().toLowerCase() : null;
       const cleanPhone = phone ? phone.trim() : null;
+
+      // Extract string URL if shop_logo or avatar is passed as an object from ImgBB
+      const cleanShopLogo = typeof shop_logo === 'object' && shop_logo !== null ? (shop_logo.url || shop_logo.display_url || '') : (shop_logo || '');
+      const cleanAvatar = typeof avatar === 'object' && avatar !== null ? (avatar.url || avatar.display_url || '') : (avatar || '');
+      const targetLogo = cleanShopLogo || cleanAvatar || null;
 
       const sellerQueryOr = [];
       if (sellerId && ObjectId.isValid(sellerId) && sellerId.length === 24) {
@@ -1792,8 +2124,8 @@ app.put('/api/sellers/profile', async (req, res) => {
         ...(trade_license ? { trade_license: trade_license.trim() } : {}),
         ...(commission_rate !== undefined ? { commission_rate: Number(commission_rate) } : {}),
         ...(balance !== undefined ? { balance: Number(balance) } : {}),
-        ...(shop_logo ? { shop_logo } : {}),
-        ...(shop_banner ? { shop_banner } : {}),
+        ...(targetLogo ? { shop_logo: targetLogo, avatar: targetLogo } : {}),
+        ...(shop_banner ? { shop_banner: (typeof shop_banner === 'object' && shop_banner !== null ? (shop_banner.url || shop_banner.display_url || '') : shop_banner) } : {}),
         ...(shop_description !== undefined ? { shop_description: shop_description.trim() } : {}),
         ...(bank_account ? { bank_account } : {}),
         ...(bkash_number ? { bkash_number } : {}),
@@ -1803,11 +2135,11 @@ app.put('/api/sellers/profile', async (req, res) => {
 
       let seller = null;
       if (sellerQueryOr.length > 0) {
-        seller = await db.collection('sellers').findOne({ $or: sellerQueryOr });
+        seller = await currentDb.collection('sellers').findOne({ $or: sellerQueryOr });
       }
 
       if (seller) {
-        await db.collection('sellers').updateOne({ _id: seller._id }, { $set: updateDoc });
+        await currentDb.collection('sellers').updateOne({ _id: seller._id }, { $set: updateDoc });
       } else {
         const newSellerDoc = {
           user_id: cleanUserId || '',
@@ -1815,7 +2147,8 @@ app.put('/api/sellers/profile', async (req, res) => {
           shop_name: shop_name || `${seller_name || 'Seller'} Store`,
           phone: cleanPhone || '',
           email: cleanEmail || '',
-          shop_logo: shop_logo || 'https://images.unsplash.com/photo-1542838132-92c53300491e?auto=format&fit=crop&w=400&q=80',
+          shop_logo: targetLogo || 'https://images.unsplash.com/photo-1542838132-92c53300491e?auto=format&fit=crop&w=400&q=80',
+          avatar: targetLogo || 'https://images.unsplash.com/photo-1542838132-92c53300491e?auto=format&fit=crop&w=400&q=80',
           status: 'approved',
           balance: balance !== undefined ? Number(balance) : 0,
           commission_rate: commission_rate !== undefined ? Number(commission_rate) : 10,
@@ -1828,7 +2161,7 @@ app.put('/api/sellers/profile', async (req, res) => {
           updated_at: new Date(),
           ...updateDoc
         };
-        const result = await db.collection('sellers').insertOne(newSellerDoc);
+        const result = await currentDb.collection('sellers').insertOne(newSellerDoc);
         seller = { _id: result.insertedId, ...newSellerDoc };
       }
 
@@ -1845,13 +2178,13 @@ app.put('/api/sellers/profile', async (req, res) => {
           ...(seller_name ? { name: seller_name.trim(), name_bn: seller_name.trim(), name_en: seller_name.trim() } : {}),
           ...(cleanPhone ? { phone: cleanPhone } : {}),
           ...(cleanEmail ? { email: cleanEmail } : {}),
-          ...(shop_logo ? { avatar: shop_logo } : {}),
+          ...(targetLogo ? { avatar: targetLogo } : {}),
           updatedAt: new Date()
         };
-        await db.collection('users').updateMany({ $or: userQueryOr }, { $set: userUpdate });
+        await currentDb.collection('users').updateMany({ $or: userQueryOr }, { $set: userUpdate });
       }
 
-      const finalSeller = await db.collection('sellers').findOne({
+      const finalSeller = await currentDb.collection('sellers').findOne({
         $or: sellerQueryOr.length > 0 ? sellerQueryOr : [{ _id: seller._id }]
       });
 
@@ -3256,8 +3589,9 @@ app.put('/api/users/profile', async (req, res) => {
       return res.status(400).json({ success: false, message: 'ইউজার সনাক্ত করা যায়নি' });
     }
 
-    if (db) {
-      const usersCol = db.collection('users');
+    const currentDb = db || await getDb().catch(() => null);
+    if (currentDb) {
+      const usersCol = currentDb.collection('users');
       const orCond = [];
       if (userId) {
         orCond.push({ _id: userId }, { id: userId });
@@ -3281,11 +3615,16 @@ app.put('/api/users/profile', async (req, res) => {
         }
       }
 
+      // Sanitize avatar if passed as an object or string
+      const cleanAvatar = typeof avatar === 'object' && avatar !== null 
+        ? (avatar.url || avatar.display_url || '') 
+        : (typeof avatar === 'string' ? avatar.trim() : (avatar !== undefined ? avatar : user.avatar));
+
       const updateFields = {
         name: name ? name.trim() : user.name,
         phone: phone ? phone.trim() : user.phone,
         email: email ? email.toLowerCase().trim() : user.email,
-        avatar: avatar !== undefined ? avatar : user.avatar,
+        avatar: cleanAvatar !== undefined ? cleanAvatar : user.avatar,
         address: address !== undefined ? address : user.address,
         city: city !== undefined ? city : (user.city || 'Dhaka'),
         district: district !== undefined ? district : (user.district || 'Dhaka'),
@@ -3297,6 +3636,29 @@ app.put('/api/users/profile', async (req, res) => {
       }
 
       await usersCol.updateOne({ _id: user._id }, { $set: updateFields });
+
+      // Synchronize seller document if this user has a seller profile
+      if (cleanAvatar) {
+        const sellerOr = [];
+        if (user._id) sellerOr.push({ user_id: String(user._id) });
+        if (user.email) sellerOr.push({ email: user.email.toLowerCase().trim() });
+        if (user.phone) sellerOr.push({ phone: user.phone.trim() });
+
+        if (sellerOr.length > 0) {
+          await currentDb.collection('sellers').updateMany(
+            { $or: sellerOr },
+            { 
+              $set: { 
+                shop_logo: cleanAvatar, 
+                avatar: cleanAvatar, 
+                ...(name ? { seller_name: name.trim() } : {}), 
+                updated_at: new Date() 
+              } 
+            }
+          ).catch(() => {});
+        }
+      }
+
       const updatedUser = await usersCol.findOne({ _id: user._id });
       const userRes = {
         ...updatedUser,
